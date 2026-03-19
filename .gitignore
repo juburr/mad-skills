@@ -1,0 +1,4 @@
+# Local development directory used to clone repositories
+# and give sandboxed LLM-based coding assistants access
+# to the libraries they're writing skills for.
+.ref/

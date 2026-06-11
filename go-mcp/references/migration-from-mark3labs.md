@@ -2,6 +2,8 @@
 
 Step-by-step guide for migrating MCP servers and clients from `github.com/mark3labs/mcp-go` to `github.com/modelcontextprotocol/go-sdk`.
 
+> Verified against SDK v1.6.1.
+
 ## Overview of Changes
 
 The official SDK is **not a fork** of mark3labs/mcp-go. It is an independent implementation with a different API design. Key architectural differences:
@@ -39,7 +41,7 @@ import (
 
 Install:
 ```bash
-go get github.com/modelcontextprotocol/go-sdk@latest
+go get github.com/modelcontextprotocol/go-sdk@v1.6.1
 ```
 
 ## Step 2: Migrate Server Creation
@@ -136,7 +138,7 @@ type Input struct {
 
 ### Enum Fields
 
-Struct tags do not support enums directly. Define the schema manually or modify it after generation:
+Struct tags do not support enums directly. The preferred approach keeps the typed generic handler and sets `Tool.InputSchema` from `jsonschema.For[T]` with `jsonschema.ForOptions{TypeSchemas: ...}` — see "Schema Customization" in `reference.md`. Alternatively, define the schema manually with the low-level `AddTool` method:
 
 **Before:**
 ```go
@@ -172,12 +174,13 @@ s.AddTool(&mcp.Tool{
 
 ### Low-Level Fallback
 
-For complex schemas or incremental migration, use the non-generic `server.AddTool` method directly. This preserves the two-return-value handler signature:
+For complex schemas or incremental migration, use the non-generic `server.AddTool` method directly. This preserves the two-return-value handler signature. Unlike the generic form, `InputSchema` is required — `AddTool` panics if it is nil:
 
 ```go
 s.AddTool(&mcp.Tool{
     Name:        "ping",
     Description: "Health check.",
+    InputSchema: map[string]any{"type": "object"},  // required; use this for no-input tools
 }, func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
     return &mcp.CallToolResult{
         Content: []mcp.Content{&mcp.TextContent{Text: "pong"}},
@@ -237,18 +240,16 @@ return &mcp.CallToolResult{
     Content: []mcp.Content{&mcp.TextContent{Text: "user not found"}},
 }, nil, nil
 
-// Infrastructure error (protocol level)
+// CAUTION — this is NOT a protocol error in the official SDK. A plain Go
+// error from a typed handler is wrapped into a tool result with IsError: true,
+// and the message is shown to the LLM:
 return nil, nil, fmt.Errorf("database down: %w", err)
+
+// Infrastructure error (protocol level, hidden from the LLM): return *jsonrpc.Error
+return nil, nil, &jsonrpc.Error{Code: jsonrpc.CodeInternalError, Message: "internal failure"}
 ```
 
-With the generic handler, returning a regular Go error automatically sets `IsError: true` and populates content with the error message. Do not leak secrets in error strings — the LLM will see them:
-```go
-// This becomes a tool error (IsError: true) visible to the LLM
-return nil, nil, fmt.Errorf("user not found")
-
-// For true protocol errors that should NOT reach the LLM, return *jsonrpc.Error
-return nil, nil, &jsonrpc.Error{Code: jsonrpc.InternalError, Message: "internal failure"}
-```
+This is a behavioral difference from mark3labs, where `return nil, err` produced a protocol-level error. In the official SDK, only `*jsonrpc.Error` is treated as a protocol error; any other Go error becomes a tool error visible to the LLM. Do not leak secrets in error strings.
 
 ## Step 5: Migrate Resources
 
@@ -555,7 +556,7 @@ s.SendNotificationToSession(sessionID, method, params)
 
 **After:**
 
-Tool/resource/prompt list change notifications are sent automatically when you call `AddTool`, `RemoveTool`, `AddResource`, etc.
+Tool/resource/prompt list change notifications are sent automatically when you call `AddTool`, `RemoveTools`, `AddResource`, etc.
 
 For resource update notifications:
 ```go
@@ -713,7 +714,7 @@ Session access patterns differ significantly. In the official SDK, the `getServe
 
 3. **No convenience constructors.** `NewToolResultText`, `NewToolResultError`, `NewToolResultImage` do not exist. Build `CallToolResult` structs directly.
 
-4. **Enum support.** Struct-tag-based schema generation does not support enums. Use a manual `InputSchema` map or the low-level `AddTool` method for tools requiring enum constraints.
+4. **Enum support.** Struct-tag-based schema generation does not support enums. Set `Tool.InputSchema` explicitly — either via `jsonschema.For[T]` with `ForOptions{TypeSchemas: ...}` (keeps the typed handler) or a manual schema with the low-level `AddTool` method.
 
 5. **`req` is a pointer.** All request types (`*CallToolRequest`, `*ReadResourceRequest`, etc.) are pointers in handler signatures. mark3labs uses value types.
 

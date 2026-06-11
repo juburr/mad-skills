@@ -1,5 +1,7 @@
 # Security Labels
 
+> Verified against SDK v1.6.1.
+
 Sensitivity labeling, JWT-based row-level security, and mTLS patterns for MCP servers. These patterns apply to any multi-tenant system requiring data-level access control and response-level security labeling — enterprise data governance, regulated industries, or internal sensitivity tiers.
 
 ## Sensitivity Labels in `_meta`

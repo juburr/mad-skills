@@ -1,6 +1,6 @@
 # API Reference
 
-Complete type reference for ADK Go.
+Complete type reference for ADK Go. Verified against `google.golang.org/adk` v1.4.0.
 
 ## Core Interfaces
 
@@ -12,6 +12,11 @@ type Agent interface {
     Description() string
     Run(InvocationContext) iter.Seq2[*session.Event, error]
     SubAgents() []Agent
+    FindAgent(name string) Agent     // Recursive lookup by name (v1.1.0+).
+    FindSubAgent(name string) Agent
+
+    // Has an unexported method: user code CANNOT implement this interface.
+    // Always construct agents via agent.New, llmagent.New, or workflow constructors.
 }
 ```
 
@@ -228,18 +233,20 @@ type InvocationContext interface {
 }
 ```
 
-### tool.Context
+### agent.ToolContext (alias: tool.Context)
 
 ```go
-type Context interface {
-    agent.CallbackContext
+type ToolContext interface {
+    CallbackContext
     FunctionCallID() string
     Actions() *session.EventActions
-    SearchMemory(context.Context, string) (*memory.SearchResponse, error)
+    SearchMemory(ctx context.Context, query string) (*memory.SearchResponse, error)
     ToolConfirmation() *toolconfirmation.ToolConfirmation
     RequestConfirmation(hint string, payload any) error
 }
 ```
+
+Since v1.4.0, `tool.Context` is a deprecated type alias (`type Context = agent.ToolContext`); existing code compiles unchanged, but `agent.ToolContext` is the canonical name. Constructors for tests/embedding: `agent.NewToolContext`, `agent.NewCallbackContext`.
 
 ## session.Event
 
@@ -293,19 +300,23 @@ type LLMRequest struct {
 }
 
 type LLMResponse struct {
-    Content            *genai.Content
-    CitationMetadata   *genai.CitationMetadata
-    GroundingMetadata  *genai.GroundingMetadata
-    UsageMetadata      *genai.GenerateContentResponseUsageMetadata
-    CustomMetadata     map[string]any
-    LogprobsResult     *genai.LogprobsResult
-    Partial            bool             // Streaming: incomplete chunk.
-    TurnComplete       bool             // Streaming: response fully complete.
-    Interrupted        bool
-    ErrorCode          string
-    ErrorMessage       string
-    FinishReason       genai.FinishReason
-    AvgLogprobs        float64
+    Content             *genai.Content
+    CitationMetadata    *genai.CitationMetadata
+    GroundingMetadata   *genai.GroundingMetadata
+    UsageMetadata       *genai.GenerateContentResponseUsageMetadata
+    CustomMetadata      map[string]any
+    LogprobsResult      *genai.LogprobsResult
+    InputTranscription  *genai.Transcription   // Live sessions (v1.3.0+).
+    OutputTranscription *genai.Transcription   // Live sessions (v1.3.0+).
+    ModelVersion        string
+    Partial             bool             // Streaming: incomplete chunk.
+    TurnComplete        bool             // Streaming: response fully complete.
+    Interrupted         bool
+    SessionResumptionHandle string       // Live sessions (v1.3.0+).
+    ErrorCode           string
+    ErrorMessage        string
+    FinishReason        genai.FinishReason
+    AvgLogprobs         float64
 }
 ```
 
@@ -336,27 +347,49 @@ type Service interface {
 }
 
 func InMemoryService() Service
+
+type GetRequest struct {
+    AppName   string
+    UserID    string
+    SessionID string
+    NumRecentEvents int        // Optional: at most N most recent events.
+    After           time.Time  // Optional: events with timestamp >= After.
+}
 ```
 
 Database-backed: `google.golang.org/adk/session/database`
 Vertex AI-backed: `google.golang.org/adk/session/vertexai`
 
-## runner.Config
+## runner.Config and Runner
 
 ```go
 type Config struct {
-    AppName         string
-    Agent           agent.Agent
-    SessionService  session.Service
-    ArtifactService artifact.Service    // Optional.
-    MemoryService   memory.Service      // Optional.
-    PluginConfig    PluginConfig
+    AppName           string
+    Agent             agent.Agent
+    SessionService    session.Service
+    ArtifactService   artifact.Service    // Optional.
+    MemoryService     memory.Service      // Optional.
+    PluginConfig      PluginConfig
+    AutoCreateSession bool                // v1.0.0+: Run creates the session if ID not found.
 }
 
 type PluginConfig struct {
     Plugins      []*plugin.Plugin
     CloseTimeout time.Duration
 }
+
+func New(cfg Config) (*Runner, error)
+
+// Run executes one turn. opts is v1.0.0+; existing call sites compile unchanged.
+func (r *Runner) Run(ctx context.Context, userID, sessionID string, msg *genai.Content,
+    cfg agent.RunConfig, opts ...RunOption) iter.Seq2[*session.Event, error]
+
+// RunLive opens a bidirectional (live) session. v1.3.0+.
+func (r *Runner) RunLive(ctx context.Context, userID, sessionID string,
+    cfg agent.LiveRunConfig, opts ...RunOption) (agent.LiveSession, iter.Seq2[*session.Event, error], error)
+
+type RunOption func(*runOptions)
+func WithStateDelta(delta map[string]any) RunOption  // Inject state before the run.
 ```
 
 ## agent.RunConfig
@@ -374,7 +407,38 @@ const (
 )
 ```
 
-## functiontool.Config
+## Live Sessions (v1.3.0+)
+
+Used with `Runner.RunLive` and live-capable Gemini models.
+
+```go
+type LiveSession interface {     // agent.LiveSession
+    Send(req LiveRequest) error
+    Close() error
+}
+
+type LiveRequest struct {
+    // RealtimeInput can be *genai.Blob, *genai.ActivityStart, or *genai.ActivityEnd.
+    RealtimeInput any
+    // Content is standard text/multimodal user content, or a FunctionResponse reply.
+    Content *genai.Content
+}
+
+type LiveRunConfig struct {
+    ResponseModalities       []genai.Modality
+    SpeechConfig             *genai.SpeechConfig
+    InputAudioTranscription  *genai.AudioTranscriptionConfig
+    OutputAudioTranscription *genai.AudioTranscriptionConfig
+    RealtimeInputConfig      *genai.RealtimeInputConfig
+    EnableAffectiveDialog    bool
+    Proactivity              *genai.ProactivityConfig
+    SessionResumption        *genai.SessionResumptionConfig
+    SaveLiveBlob             bool    // Save audio blobs as artifacts.
+    MaxLLMCalls              int
+}
+```
+
+## functiontool
 
 ```go
 type Config struct {
@@ -386,7 +450,17 @@ type Config struct {
     RequireConfirmation         bool                // Static HITL flag.
     RequireConfirmationProvider any                 // func(toolInput T) bool
 }
+
+type Func[TArgs, TResults any] func(tool.Context, TArgs) (TResults, error)
+func New[TArgs, TResults any](cfg Config, handler Func[TArgs, TResults]) (tool.Tool, error)
+
+// Streaming tools (live sessions, v1.3.0+): each yielded string is streamed
+// to the model as an intermediate function result.
+type StreamingFunc[TArgs any] func(tool.Context, TArgs) iter.Seq2[string, error]
+func NewStreaming[TArgs any](cfg Config, handler StreamingFunc[TArgs]) (tool.Tool, error)
 ```
+
+`TArgs` must be a struct or map (or pointer to one); primitives are rejected.
 
 ## agenttool.Config
 
@@ -400,7 +474,7 @@ type Config struct {
 
 Pass `nil` for `cfg` to use defaults (`SkipSummarization: false`).
 
-## tool.WithConfirmation (v0.6.0+, experimental)
+## tool.WithConfirmation (experimental)
 
 ```go
 type ConfirmationProvider func(toolName string, toolInput any) bool
@@ -408,7 +482,7 @@ type ConfirmationProvider func(toolName string, toolInput any) bool
 func WithConfirmation(toolset Toolset, requireConfirmation bool, provider ConfirmationProvider) Toolset
 ```
 
-Wraps a `Toolset` so every tool checks HITL confirmation before executing. If `provider` is non-nil, it takes precedence over the static `requireConfirmation` flag. See `integrations.md` for usage examples.
+Wraps a `Toolset` so every tool checks HITL confirmation before executing. If `provider` is non-nil, it takes precedence over the static `requireConfirmation` flag. Still marked experimental at v1.4.0 (excluded from the v1.0 API stability guarantee). See `integrations.md` for usage examples.
 
 ## tool.Predicate and FilterToolset
 
@@ -474,24 +548,45 @@ type Config struct {
 }
 ```
 
-## remoteagent.A2AConfig
+## remoteagent/v2 A2AConfig
+
+The canonical remote-agent package is `agent/remoteagent/v2` (a2a-go v2 types). The v1 `agent/remoteagent` package (with `AgentCardSource`/`CardResolveOptions`/`ClientFactory` fields) is deprecated.
 
 ```go
+// import remoteagent "google.golang.org/adk/agent/remoteagent/v2"
+
+func NewA2A(cfg A2AConfig) (agent.Agent, error)
+
+// Resolves a card from an http(s) URL or a local file path.
+func NewAgentCardProvider(source string, opts ...agentcard.ResolveOption) AgentCardProvider
+type AgentCardProvider func(ctx context.Context) (*a2a.AgentCard, error)
+
 type A2AConfig struct {
-    Name                   string
-    Description            string
-    AgentCard              *a2a.AgentCard       // Direct card, OR:
-    AgentCardSource        string               // URL to resolve card from.
-    CardResolveOptions     []agentcard.ResolveOption
+    Name        string
+    Description string
+
+    AgentCard         *a2a.AgentCard     // Static card. Either this OR:
+    AgentCardProvider AgentCardProvider  // Resolved on each invocation.
+
     BeforeAgentCallbacks   []agent.BeforeAgentCallback
     BeforeRequestCallbacks []BeforeA2ARequestCallback
-    Converter              A2AEventConverter
+    Converter              A2AEventConverter         // Default: adka2a.ToSessionEvent.
     AfterRequestCallbacks  []AfterA2ARequestCallback
     AfterAgentCallbacks    []agent.AfterAgentCallback
-    ClientFactory          *a2aclient.Factory
-    MessageSendConfig      *a2a.MessageSendConfig
+
+    A2APartConverter   adka2a.A2APartConverter    // Custom A2A→GenAI part conversion.
+    GenAIPartConverter adka2a.GenAIPartConverter  // Custom GenAI→A2A part conversion.
+
+    ClientProvider    A2AClientProvider          // Custom message-sending implementation.
+    MessageSendConfig *a2a.SendMessageConfig
+
+    // Called if Run exits before a terminal event from the remote server.
+    // Default behavior: cancel RPC with a 5s timeout.
+    RemoteTaskCleanupCallback A2ARemoteTaskCleanupCallback
 }
 ```
+
+Server side: `server/adka2a/v2` exposes agents over A2A (the launcher's `a2a` mode uses it); `server/adkrest` embeds the REST API in existing services.
 
 ## plugin.Config
 
@@ -523,6 +618,7 @@ type Service interface {
     Delete(ctx context.Context, req *DeleteRequest) error
     List(ctx context.Context, req *ListRequest) (*ListResponse, error)
     Versions(ctx context.Context, req *VersionsRequest) (*VersionsResponse, error)
+    GetArtifactVersion(ctx context.Context, req *GetArtifactVersionRequest) (*GetArtifactVersionResponse, error)  // v1.1.0+
 }
 
 func InMemoryService() Service
@@ -532,13 +628,28 @@ GCS-backed: `google.golang.org/adk/artifact/gcsartifact`
 
 ## memory.Service
 
+Method names changed at v1.0.0 (`AddSession` → `AddSessionToMemory`, `Search` → `SearchMemory`); request/response type names did not change.
+
 ```go
 type Service interface {
-    AddSession(ctx context.Context, s session.Session) error
-    Search(ctx context.Context, req *SearchRequest) (*SearchResponse, error)
+    AddSessionToMemory(ctx context.Context, s session.Session) error
+    SearchMemory(ctx context.Context, req *SearchRequest) (*SearchResponse, error)
 }
 
 func InMemoryService() Service
+```
+
+Vertex AI Memory Bank backend (v1.3.0+): `google.golang.org/adk/memory/vertexai`
+
+```go
+// import memvertexai "google.golang.org/adk/memory/vertexai"
+func NewService(ctx context.Context, config *ServiceConfig) (memory.Service, error)
+
+type ServiceConfig struct {
+    vertexaiutil.AgentEngineData             // Embedded: identifies the Agent Engine instance.
+    StateKeySessionLastUpdateTime string     // "" = use whole session for memory generation.
+    WaitForCompletion             bool
+}
 ```
 
 ## agent.Loader
@@ -554,7 +665,23 @@ func NewSingleLoader(a Agent) Loader
 func NewMultiLoader(root Agent, agents ...Agent) (Loader, error)
 ```
 
-`NewSingleLoader` provides one root agent. `NewMultiLoader` (v0.6.0+) registers multiple agents with one designated as root; returns error on duplicate names. Used with `launcher.Config.AgentLoader`.
+`NewSingleLoader` provides one root agent. `NewMultiLoader` registers multiple agents with one designated as root; returns error on duplicate names. Used with `launcher.Config.AgentLoader`.
+
+## launcher.Config
+
+```go
+type Config struct {
+    SessionService   session.Service
+    ArtifactService  artifact.Service
+    MemoryService    memory.Service
+    AgentLoader      agent.Loader
+    A2AOptions       []a2asrv.RequestHandlerOption
+    PluginConfig     runner.PluginConfig    // Plugins in launcher mode.
+    TelemetryOptions []telemetry.Option     // Telemetry in launcher mode.
+}
+```
+
+Launchers: `full.NewLauncher()` (console + web UI + API + A2A, dev), `prod.NewLauncher()` (REST API + A2A only), plus `cmd/launcher/console`, `cmd/launcher/web`, `cmd/launcher/universal` (compose custom sets via `launcher.SubLauncher`), and `cmd/launcher/agentengine` for Vertex AI Agent Engine. Pub/Sub and Eventarc trigger sublaunchers: `cmd/launcher/web/triggers/{pubsub,eventarc}`.
 
 ## telemetry
 
@@ -582,6 +709,7 @@ func (t *Providers) Shutdown(ctx context.Context) error
 | `WithSpanProcessors(...sdktrace.SpanProcessor)` | Register additional span processors. |
 | `WithLogRecordProcessors(...sdklog.Processor)` | Register additional log processors. |
 | `WithTracerProvider(*sdktrace.TracerProvider)` | Override the default TracerProvider. |
+| `WithLoggerProvider(*sdklog.LoggerProvider)` | Override the default LoggerProvider. |
 | `WithGenAICaptureMessageContent(bool)` | Log message content (default from `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT` env). |
 
 ## Plugin Callback Types
@@ -639,3 +767,56 @@ func MustNew(name string) *plugin.Plugin
 ```
 
 Pass `""` for name to default to `"logging_plugin"`. Logs to console with ANSI grey coloring.
+
+## tool/exampletool (v1.0.0+)
+
+Injects few-shot examples into the LLM request as system-instruction text (a request processor, not an LLM-invoked tool).
+
+```go
+type Example struct {
+    Input  *genai.Content   `json:"input"`
+    Output []*genai.Content `json:"output"`
+}
+
+type ExampleToolConfig struct {
+    Examples []*Example
+}
+
+func New(config ExampleToolConfig) (tool.Tool, error)  // Concrete unexported type; use as tool.Tool.
+```
+
+## tool/skilltoolset (v1.2.0+)
+
+Agent Skills with progressive disclosure: the toolset injects skill frontmatter into the system instruction and exposes `load_skill` / resource-loading tools so the LLM pulls full skill content on demand.
+
+```go
+// import "google.golang.org/adk/tool/skilltoolset"
+//        "google.golang.org/adk/tool/skilltoolset/skill"
+
+type Config struct {
+    Source            skill.Source  // Where skills come from (e.g., filesystem source).
+    Name              string
+    SystemInstruction string
+}
+
+func New(ctx context.Context, cfg Config) (*SkillToolset, error)  // Implements tool.Toolset.
+```
+
+The `skill` subpackage provides `Frontmatter`, `Parse`, `ParseBytes`, `Validate`, `Build`, the `Source` interface, a filesystem source, and preload/merge source proxies.
+
+## model/apigee (v1.0.0+)
+
+Routes Gemini calls through an Apigee proxy:
+
+```go
+func NewModel(ctx context.Context, modelName string, opts ...Option) (model.LLM, error)  // Concrete unexported type; use as model.LLM.
+// Options: WithProxyURL(string), WithCustomHeaders(http.Header), WithHTTPClient(*http.Client)
+```
+
+## util/instructionutil
+
+```go
+// Performs {key} / {artifact.key} / {key?} substitution against session state.
+// Use inside an InstructionProvider (providers do not auto-substitute).
+func InjectSessionState(ctx agent.ReadonlyContext, template string) (string, error)
+```

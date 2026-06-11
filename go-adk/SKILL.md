@@ -8,7 +8,9 @@ description: Guides development of AI agents using Google's Agent Development Ki
 
 # ADK Go
 
-Google's Agent Development Kit for Go (`google.golang.org/adk`) is a code-first toolkit for building AI agents. It is optimized for Gemini and model-agnostic via the `model.LLM` interface. Requires Go 1.24.4+.
+Google's Agent Development Kit for Go (`google.golang.org/adk`) is a code-first toolkit for building AI agents. It is optimized for Gemini and model-agnostic via the `model.LLM` interface. Requires Go 1.25.0+.
+
+> **Verified against ADK Go v1.4.0** (released 2026-05-29). The v1 API is stable. If your training data predates v1.0.0 (March 2026), trust this document over recalled pre-v1 (v0.x) APIs — several interfaces changed at the 1.0 boundary (see Known Gotchas). Official docs: https://adk.dev/ (formerly google.github.io/adk-docs).
 
 ```bash
 go get google.golang.org/adk
@@ -20,7 +22,7 @@ go get google.golang.org/adk
 import (
     "google.golang.org/adk/agent"                                  // Core agent interface
     "google.golang.org/adk/agent/llmagent"                         // LLM-powered agents
-    "google.golang.org/adk/agent/remoteagent"                      // Remote A2A agents
+    remoteagent "google.golang.org/adk/agent/remoteagent/v2"       // Remote A2A agents (v1 package is deprecated)
     "google.golang.org/adk/agent/workflowagents/sequentialagent"   // Sequential orchestration
     "google.golang.org/adk/agent/workflowagents/parallelagent"     // Parallel orchestration
     "google.golang.org/adk/agent/workflowagents/loopagent"         // Loop orchestration
@@ -36,6 +38,11 @@ import (
     "google.golang.org/adk/tool/loadartifactstool"                 // LLM-invoked artifact loading
     "google.golang.org/adk/tool/loadmemorytool"                    // LLM-invoked memory search
     "google.golang.org/adk/tool/preloadmemorytool"                 // Auto-injects memory per request
+    "google.golang.org/adk/tool/skilltoolset"                      // Agent Skills (progressive disclosure)
+    "google.golang.org/adk/tool/exampletool"                       // Few-shot example injection
+    "google.golang.org/adk/model/apigee"                           // Gemini via an Apigee proxy
+    "google.golang.org/adk/memory/vertexai"                        // Vertex AI Memory Bank backend
+    "google.golang.org/adk/util/instructionutil"                   // Manual {key} substitution helper
     "google.golang.org/adk/telemetry"                              // OpenTelemetry setup
     "google.golang.org/adk/plugin"                                 // Plugin system
     "google.golang.org/adk/plugin/retryandreflect"                 // Self-healing tool retries
@@ -51,20 +58,21 @@ import (
 ## Creating a Model
 
 ```go
-// Gemini API (default)
-model, err := gemini.NewModel(ctx, "gemini-2.5-flash", &genai.ClientConfig{
+// Gemini API (default). Any current Gemini model ID works; the official
+// v1.4.0 quickstart uses "gemini-3.1-flash-lite".
+model, err := gemini.NewModel(ctx, "gemini-3.1-flash-lite", &genai.ClientConfig{
     APIKey: os.Getenv("GOOGLE_API_KEY"),
 })
 
 // Vertex AI
-model, err := gemini.NewModel(ctx, "gemini-2.5-flash", &genai.ClientConfig{
+model, err := gemini.NewModel(ctx, "gemini-3.1-flash-lite", &genai.ClientConfig{
     Project:  "my-project",
     Location: "us-central1",
     Backend:  genai.BackendVertexAI,
 })
 ```
 
-For OpenAI or custom providers, read `references/integrations.md`.
+For Gemini behind an Apigee proxy, use `apigee.NewModel`. For OpenAI or custom providers, read `references/integrations.md`.
 
 ## Creating an Agent
 
@@ -92,7 +100,7 @@ myAgent, err := llmagent.New(llmagent.Config{
 | `Model` | `model.LLM` implementation (Gemini, custom, etc.) |
 | `Instruction` | System prompt. Supports `{state_key}`, `{artifact.key}`, and `{key?}` (optional) substitution. |
 | `GlobalInstruction` | Prepended to all sub-agent instructions. Same substitution syntax. |
-| `InstructionProvider` | `func(agent.ReadonlyContext) (string, error)` for dynamic instructions. Note: `{key}` placeholders are **not** auto-injected when using a provider. |
+| `InstructionProvider` | `func(agent.ReadonlyContext) (string, error)` for dynamic instructions. Note: `{key}` placeholders are **not** auto-injected when using a provider; call `instructionutil.InjectSessionState(ctx, template)` to substitute manually. |
 | `Tools` | Slice of `tool.Tool` the agent can invoke. |
 | `Toolsets` | Slice of `tool.Toolset` (e.g., `mcptoolset`) for dynamic tool discovery. |
 | `SubAgents` | Child agents. Enables LLM-driven delegation via `transfer_to_agent`. |
@@ -111,7 +119,7 @@ For the complete config including all callback fields, read `references/api-refe
 
 ### FunctionTool
 
-Wrap any Go function as an agent tool. Argument and result structs are auto-converted to JSON schemas.
+Wrap any Go function as an agent tool. Argument and result types are auto-converted to JSON schemas. Args must be a struct or map (or a pointer to one); primitives are rejected.
 
 ```go
 type WeatherArgs struct {
@@ -131,9 +139,11 @@ weatherTool, err := functiontool.New(functiontool.Config{
 }, getWeather)
 ```
 
+For tools that stream incremental results during live (bidi) sessions, use `functiontool.NewStreaming(cfg, func(ctx tool.Context, args TArgs) iter.Seq2[string, error] {...})`.
+
 ### Tool Context
 
-Inside a tool function, `tool.Context` provides access to state, artifacts, and agent transfer:
+Inside a tool function, `tool.Context` provides access to state, artifacts, and agent transfer. (Since v1.4.0, `tool.Context` is an alias for `agent.ToolContext` — same methods, new canonical name.)
 
 ```go
 func myTool(ctx tool.Context, args MyArgs) (MyResult, error) {
@@ -203,11 +213,7 @@ These tools require backing services in `runner.Config`. Memory tools fail with 
 agent, err := llmagent.New(llmagent.Config{
     Name:  "memory_agent",
     Model: model,
-    Tools: []tool.Tool{
-        preloadmemorytool.New(),   // Auto-injects memory context
-        loadmemorytool.New(),      // LLM can search for more
-        loadartifactstool.New(),   // LLM can load artifacts
-    },
+    Tools: []tool.Tool{preloadmemorytool.New(), loadmemorytool.New(), loadartifactstool.New()},
 })
 
 // Runner must have backing services configured:
@@ -218,6 +224,8 @@ r, _ := runner.New(runner.Config{
     ArtifactService: artifact.InMemoryService(),  // Required for artifact tools
 })
 ```
+
+Production backends: `memory/vertexai` (Vertex AI Memory Bank), `session/database` (GORM: Postgres, SQLite, ...), `session/vertexai`, `artifact/gcsartifact` (GCS).
 
 ## Orchestration Patterns
 
@@ -252,27 +260,7 @@ pipeline, _ := sequentialagent.New(sequentialagent.Config{
 })
 ```
 
-### Quick Example: Parallel Fan-Out / Gather
-
-```go
-api1, _ := llmagent.New(llmagent.Config{Name: "API1", Model: m, OutputKey: "api1_data"})
-api2, _ := llmagent.New(llmagent.Config{Name: "API2", Model: m, OutputKey: "api2_data"})
-
-gather, _ := parallelagent.New(parallelagent.Config{
-    AgentConfig: agent.Config{Name: "Gather", SubAgents: []agent.Agent{api1, api2}},
-})
-
-synth, _ := llmagent.New(llmagent.Config{
-    Name: "Synth", Model: m,
-    Instruction: "Combine {api1_data} and {api2_data}.",
-})
-
-workflow, _ := sequentialagent.New(sequentialagent.Config{
-    AgentConfig: agent.Config{Name: "FanOutGather", SubAgents: []agent.Agent{gather, synth}},
-})
-```
-
-For all patterns with complete code examples (including loop/critic-refiner, dynamic delegation, custom planning loops, and composite workflows), read `references/orchestration.md`.
+For all patterns with complete code examples (including parallel fan-out/gather, loop/critic-refiner, dynamic delegation, custom planning loops, and composite workflows), read `references/orchestration.md`.
 
 ## State Management
 
@@ -287,18 +275,7 @@ State is scoped by key prefix:
 
 ### OutputKey and Instruction Substitution
 
-`OutputKey` stores an agent's final text response in session state. `{key}` placeholders in `Instruction` are auto-replaced with state values:
-
-```go
-step1, _ := llmagent.New(llmagent.Config{
-    Name: "Researcher", Model: m, OutputKey: "research",
-    Instruction: "Research the topic: {topic}",
-})
-step2, _ := llmagent.New(llmagent.Config{
-    Name: "Writer", Model: m,
-    Instruction: "Write a summary based on: {research}",
-})
-```
+`OutputKey` stores an agent's final text response in session state. `{key}` placeholders in `Instruction` are auto-replaced with state values (see the sequential pipeline example above).
 
 Create sessions with initial state:
 
@@ -321,11 +298,13 @@ resp, _ := sessionService.Create(ctx, &session.CreateRequest{
 })
 
 r, _ := runner.New(runner.Config{
-    AppName:        "my_app",
-    Agent:          myAgent,
-    SessionService: sessionService,
+    AppName:           "my_app",
+    Agent:             myAgent,
+    SessionService:    sessionService,
+    AutoCreateSession: false, // true: Run creates the session if the ID is unknown
 })
 
+// Optional trailing RunOption: runner.WithStateDelta(map[string]any{...})
 input := genai.NewContentFromText("Hello!", genai.RoleUser)
 for event, err := range r.Run(ctx, "user1", resp.Session.ID(), input, agent.RunConfig{}) {
     if err != nil {
@@ -341,10 +320,26 @@ for event, err := range r.Run(ctx, "user1", resp.Session.ID(), input, agent.RunC
 }
 ```
 
+### Live Streaming (Bidirectional)
+
+For audio/realtime use cases, `RunLive` opens a bidirectional session (requires a live-capable Gemini model):
+
+```go
+live, events, err := r.RunLive(ctx, "user1", sessionID, agent.LiveRunConfig{
+    ResponseModalities: []genai.Modality{genai.ModalityText},
+})
+// live.Send(agent.LiveRequest{Content: ...}) to send; iterate events to receive.
+// defer live.Close()
+```
+
+For `agent.LiveRunConfig` fields (speech config, transcription, session resumption) read `references/api-reference.md`.
+
 ### Launcher Pattern (Dev/Prod Servers)
 
 ```go
 config := &launcher.Config{AgentLoader: agent.NewSingleLoader(myAgent)}
+// launcher.Config also accepts SessionService/ArtifactService/MemoryService,
+// PluginConfig, TelemetryOptions, and A2AOptions.
 // For multiple agents: agent.NewMultiLoader(rootAgent, agentB, agentC)
 l := full.NewLauncher()       // Dev: includes console + web UI + API + A2A
 // l := prod.NewLauncher()    // Prod: REST API + A2A only (no console, no web UI)
@@ -360,6 +355,8 @@ go run main.go                       # Console mode
 go run main.go web api webui         # Web UI at localhost:8080 (dev only)
 go run main.go web api a2a           # REST API + A2A server
 ```
+
+Deploy with the `adkgo` CLI (`google.golang.org/adk/cmd/adkgo`): `adkgo deploy cloudrun` or `adkgo deploy agentengine`. Pub/Sub and Eventarc trigger sublaunchers live under `cmd/launcher/web/triggers/`.
 
 ## Plugins
 
@@ -413,13 +410,18 @@ The launcher's web mode auto-initializes telemetry when `--otel_to_cloud` is set
 
 ## A2A Remote Agents
 
+Use `agent/remoteagent/v2` (built on a2a-go v2). The v1 `agent/remoteagent` package — whose config used `AgentCardSource`/`ClientFactory` fields — is deprecated.
+
 ### Consuming a Remote Agent (Client)
 
 ```go
+import remoteagent "google.golang.org/adk/agent/remoteagent/v2"
+
+// NewAgentCardProvider accepts an http(s) URL or a local file path.
 remoteAgent, err := remoteagent.NewA2A(remoteagent.A2AConfig{
-    Name:            "prime_agent",
-    Description:     "Checks if numbers are prime.",
-    AgentCardSource: "http://localhost:8001",
+    Name:              "prime_agent",
+    Description:       "Checks if numbers are prime.",
+    AgentCardProvider: remoteagent.NewAgentCardProvider("http://localhost:8001"),
 })
 
 rootAgent, _ := llmagent.New(llmagent.Config{
@@ -439,16 +441,10 @@ config := &launcher.Config{
     SessionService: session.InMemoryService(),
 }
 l := full.NewLauncher()
-if err := l.Execute(ctx, config, []string{"web", "--port", "8001", "api", "a2a", "--a2a_agent_url", "http://localhost:8001"}); err != nil {
-    log.Fatal(err)
-}
+err := l.Execute(ctx, config, []string{"web", "--port", "8001", "api", "a2a", "--a2a_agent_url", "http://localhost:8001"})
 ```
 
-```bash
-go run main.go web --port 8001 api a2a --a2a_agent_url http://localhost:8001
-```
-
-The agent card is auto-served at `http://localhost:8001/.well-known/agent-card.json`.
+The agent card is auto-served at `http://localhost:8001/.well-known/agent-card.json`. To embed A2A handling in an existing HTTP service instead of using the launcher, see `server/adka2a/v2`.
 
 ## Custom Agents
 
@@ -478,20 +474,22 @@ For the complete custom agent pattern (plan-execute-reflect loop), read `referen
 
 ## Known Gotchas
 
-- **Nested loop escalation propagation ([#522](https://github.com/google/adk-go/issues/522)).** `Escalate = true` inside a nested `loopagent` can propagate upward and stop the entire parent pipeline, not just the inner loop. As of v0.6.0, `sequentialagent` no longer depends on `loopagent` internally (PR #611), which mitigates the most common trigger. However, test nested loop exit behavior explicitly when composing multiple `loopagent` layers.
+All issue statuses below verified against v1.4.0 source (2026-06).
+
+- **Pre-v1 training data.** If you recall v0.x APIs, they may be wrong at v1.x: `memory.Service` methods are now `AddSessionToMemory`/`SearchMemory` (renamed at v1.0.0 from `AddSession`/`Search`); `artifact.Service` gained a sixth method `GetArtifactVersion` (v1.1.0); `agent/remoteagent` and `server/adka2a` are deprecated in favor of their `/v2` variants (v1.3.0); `tool.Context` is a deprecated alias for `agent.ToolContext` (v1.4.0). Pin the module version in `go.mod`.
+- **Nested loop escalation propagation ([#522](https://github.com/google/adk-go/issues/522), open).** `Escalate = true` inside a nested `loopagent` can propagate upward and stop the entire parent pipeline, not just the inner loop. Test nested loop exit behavior explicitly when composing multiple `loopagent` layers.
 - **OutputSchema disables tools.** Setting `OutputSchema` on an `llmagent` disables tool use and agent transfers. Use it only on leaf agents that produce structured final output.
-- **FunctionTool input must be a struct.** `functiontool.New` validates that the args type is a struct. Primitive types or maps will be rejected.
-- **Pre-v1 API instability.** ADK Go is pre-v1 (verified against v0.6.0). Pin your module version in `go.mod` and prefer the pkg.go.dev reference for the exact version you target.
+- **Agents cannot implement `agent.Agent` directly.** The interface has an unexported method; always construct agents via `agent.New`, `llmagent.New`, or the workflow agent constructors.
 - **Parallel agent input.** In fan-out patterns, verify sub-agents receive required context. Prefer injecting data via session state (`OutputKey` + `{placeholder}`) rather than relying on conversation history propagation.
-- **OutputKey overwrite during tool calls ([#577](https://github.com/google/adk-go/issues/577)).** Use a unique `OutputKey` for each agent in a pipeline. When an agent uses tools, intermediate function-call/response events can overwrite a shared `OutputKey` with an empty string because the guard condition triggers on non-partial events that have no text content. A fix switching to `event.IsFinalResponse()` gating is in progress (PR #578).
-- **Artifact tool panic when misconfigured ([#283](https://github.com/google/adk-go/issues/283)).** `loadartifactstool` can panic with a nil pointer dereference if added to an agent without configuring `ArtifactService` in the runner. Always set `ArtifactService` in `runner.Config` when using artifact tools, and validate required services are non-nil at startup.
-- **Nil RunConfig panic when embedding ADK ([#586](https://github.com/google/adk-go/issues/586)).** `runconfig.FromContext(ctx)` returns nil if `RunConfig` is never inserted into the context chain, causing a nil pointer dereference in `base_flow.go`. This affects teams that embed ADK into existing Go services with custom runners or invocation contexts. Guard against nil returns or ensure `RunConfig` is injected into the context before invoking agent flows.
-- **Agent identity auto-injection (v0.6.0+).** Agent `Name` and `Description` are now automatically injected into LLM system prompts. If your `Instruction` already includes identity text (e.g., "You are AgentX"), you may get duplication. Remove manual identity from instructions to avoid redundancy.
+- **OutputKey overwrite during tool calls ([#577](https://github.com/google/adk-go/issues/577), still open at v1.4.0).** Use a unique `OutputKey` for each agent in a pipeline. When an agent uses tools, intermediate function-call/response events can overwrite a shared `OutputKey` with an empty string because `maybeSaveOutputToState` gates on `!event.Partial` rather than `event.IsFinalResponse()`. The fix (PR #578) remains unmerged.
+- **Artifact tool panic when misconfigured ([#283](https://github.com/google/adk-go/issues/283), open).** `loadartifactstool` can panic with a nil pointer dereference if added to an agent without configuring `ArtifactService` in the runner. Always set `ArtifactService` in `runner.Config` when using artifact tools, and validate required services are non-nil at startup.
+- **Nil RunConfig panic when embedding ADK ([#586](https://github.com/google/adk-go/issues/586), open).** `runconfig.FromContext(ctx)` returns nil if `RunConfig` is never inserted into the context chain, causing a nil pointer dereference in `base_flow.go`. This affects teams that embed ADK into existing Go services with custom runners or invocation contexts. Guard against nil returns or ensure `RunConfig` is injected into the context before invoking agent flows.
+- **Agent identity auto-injection.** Agent `Name` and `Description` are automatically injected into LLM system prompts. If your `Instruction` already includes identity text (e.g., "You are AgentX"), you may get duplication. Remove manual identity from instructions to avoid redundancy.
 
 ## Reference Files
 
 | File | Contents | Load when |
 |---|---|---|
 | `references/orchestration.md` | All orchestration patterns with complete code: pipeline, fan-out/gather, critic/refiner loop, dynamic delegation, custom planning loops, composite workflows | Designing multi-agent workflows or implementing a specific pattern |
-| `references/api-reference.md` | Complete types: `llmagent.Config`, all callback signatures, `session.Event`, `EventActions`, `tool.Context`, `genai.GenerateContentConfig`, `runner.Config`, `plugin.Config`, built-in plugin configs, telemetry options | Looking up specific field names, types, or callback signatures |
-| `references/integrations.md` | MCP toolset (all transports, filtering, HITL), OpenAI integration status, custom `model.LLM` providers, Vertex AI config | Connecting to MCP servers, using non-Gemini models, or writing a custom provider |
+| `references/api-reference.md` | Complete types: `llmagent.Config`, all callback signatures, `session.Event`, `EventActions`, `agent.ToolContext`, `genai.GenerateContentConfig`, `runner.Config`, `RunLive`/`LiveRunConfig`, `remoteagent/v2`, `skilltoolset`, `exampletool`, `plugin.Config`, built-in plugin configs, telemetry options | Looking up specific field names, types, or callback signatures |
+| `references/integrations.md` | MCP toolset (all transports, filtering, HITL), OpenAI integration status, custom `model.LLM` providers, Apigee model proxy, Vertex AI config, service backends (database/Vertex AI sessions, Memory Bank, GCS artifacts) | Connecting to MCP servers, using non-Gemini models, writing a custom provider, or choosing service backends |

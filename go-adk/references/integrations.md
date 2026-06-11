@@ -1,6 +1,6 @@
 # Integrations
 
-MCP server integration, OpenAI/custom model providers, and Vertex AI configuration for ADK Go.
+MCP server integration, OpenAI/custom model providers, Apigee proxying, and Vertex AI configuration for ADK Go. Verified against `google.golang.org/adk` v1.4.0.
 
 ## MCP Toolset
 
@@ -133,7 +133,7 @@ mcpTools, err := mcptoolset.New(mcptoolset.Config{
 
 ### Generic Toolset Confirmation (`tool.WithConfirmation`)
 
-As of v0.6.0, HITL confirmation can be applied to **any** `tool.Toolset`, not just MCP toolsets. This wraps every tool in the toolset with confirmation logic.
+HITL confirmation can be applied to **any** `tool.Toolset`, not just MCP toolsets. This wraps every tool in the toolset with confirmation logic.
 
 ```go
 import "google.golang.org/adk/tool"
@@ -155,19 +155,20 @@ agent, err := llmagent.New(llmagent.Config{
 
 **How it works:** `WithConfirmation` returns a wrapped `Toolset` where each tool's execution checks confirmation status. When a tool requires confirmation, the agent emits a confirmation request event. The caller must approve it before the tool runs. Inside a tool function, use `ctx.ToolConfirmation()` to check status and `ctx.RequestConfirmation(hint, payload)` to trigger the approval flow.
 
-**Note:** This API is marked **experimental** and may change before v1.0.
+**Note:** This API is still marked **experimental** at v1.4.0 (excluded from the v1.0 API stability guarantee) and may change.
 
 ### mcptoolset.Config
 
 ```go
 type Config struct {
-    Client                      *mcp.Client               // Optional custom MCP client.
+    Client                      *mcp.Client                // Optional custom MCP client.
     Transport                   mcp.Transport              // Required.
     ToolFilter                  tool.Predicate             // Deprecated: use tool.FilterToolset instead.
     RequireConfirmation         bool                       // Static HITL flag for all tools.
-    RequireConfirmationProvider ConfirmationProvider       // Dynamic HITL. Takes precedence over RequireConfirmation.
+    RequireConfirmationProvider tool.ConfirmationProvider  // Dynamic HITL. Takes precedence over RequireConfirmation.
 }
 
+// Defined in package tool (a package-local duplicate was removed at v1.0.0):
 type ConfirmationProvider func(toolName string, toolInput any) bool
 ```
 
@@ -207,7 +208,7 @@ import (
 func main() {
     ctx := context.Background()
 
-    model, err := gemini.NewModel(ctx, "gemini-2.5-flash", &genai.ClientConfig{
+    model, err := gemini.NewModel(ctx, "gemini-3.1-flash-lite", &genai.ClientConfig{
         APIKey: os.Getenv("GOOGLE_API_KEY"),
     })
     if err != nil { log.Fatal(err) }
@@ -238,7 +239,7 @@ func main() {
 
 ## OpenAI Integration
 
-As of ADK-Go v0.6.0, there is no official `model/openai` provider in the published module. To use OpenAI or other non-Gemini models, implement the `model.LLM` interface yourself or use a community adapter.
+As of ADK Go v1.4.0, there is still no official `model/openai` (or Anthropic/LiteLLM-style) provider — the only built-in providers are `model/gemini` and `model/apigee`. To use OpenAI or other non-Gemini models, implement the `model.LLM` interface yourself or use a community adapter.
 
 ### Writing a Custom model.LLM Provider
 
@@ -338,10 +339,12 @@ client := openai.NewClient(
 
 ## Gemini / Vertex AI Configuration
 
+Model IDs below match the official v1.4.0 quickstart; any current Gemini model ID works.
+
 ### Gemini API (Default)
 
 ```go
-model, err := gemini.NewModel(ctx, "gemini-2.5-flash", &genai.ClientConfig{
+model, err := gemini.NewModel(ctx, "gemini-3.1-flash-lite", &genai.ClientConfig{
     APIKey: os.Getenv("GOOGLE_API_KEY"),
 })
 ```
@@ -351,7 +354,7 @@ Environment variables: `GOOGLE_API_KEY` or `GEMINI_API_KEY`.
 ### Vertex AI
 
 ```go
-model, err := gemini.NewModel(ctx, "gemini-2.5-flash", &genai.ClientConfig{
+model, err := gemini.NewModel(ctx, "gemini-3.1-flash-lite", &genai.ClientConfig{
     Project:  "my-gcp-project",
     Location: "us-central1",
     Backend:  genai.BackendVertexAI,
@@ -368,7 +371,7 @@ Environment variables:
 With no explicit config, ADK checks environment variables:
 
 ```go
-model, err := gemini.NewModel(ctx, "gemini-2.5-flash", &genai.ClientConfig{})
+model, err := gemini.NewModel(ctx, "gemini-3.1-flash-lite", &genai.ClientConfig{})
 ```
 
 ### genai.ClientConfig
@@ -383,12 +386,39 @@ type ClientConfig struct {
 }
 ```
 
+### Apigee Proxy (`model/apigee`)
+
+Route Gemini traffic through an Apigee API proxy (enterprise gateway policies, key management):
+
+```go
+import "google.golang.org/adk/model/apigee"
+
+model, err := apigee.NewModel(ctx, "gemini-3.1-flash-lite",
+    apigee.WithProxyURL("https://my-apigee-host/v1/gemini"),
+    apigee.WithCustomHeaders(http.Header{"x-api-key": []string{os.Getenv("APIGEE_KEY")}}),
+    // apigee.WithHTTPClient(customClient),
+)
+```
+
+## Service Backends
+
+| Service | In-memory | Production backends |
+|---|---|---|
+| Sessions | `session.InMemoryService()` | `session/database` (GORM dialectors: Postgres, SQLite, ...; run `database.AutoMigrate`), `session/vertexai` (Agent Engine sessions) |
+| Memory | `memory.InMemoryService()` | `memory/vertexai` (Vertex AI Memory Bank, v1.3.0+) |
+| Artifacts | `artifact.InMemoryService()` | `artifact/gcsartifact` (Google Cloud Storage) |
+
+See `api-reference.md` for constructor signatures.
+
 ## Key Dependencies
 
+Versions as pinned by ADK Go v1.4.0:
+
 ```
-google.golang.org/adk                              # ADK core
-google.golang.org/genai                             # Google GenAI types (Gemini/Vertex)
-github.com/modelcontextprotocol/go-sdk              # Official MCP SDK v1.3.1+ (NOT mark3labs/mcp-go)
-github.com/a2aproject/a2a-go                        # A2A protocol
+google.golang.org/adk                              # ADK core (v1.4.0)
+google.golang.org/genai                             # Google GenAI types (v1.57.0)
+github.com/modelcontextprotocol/go-sdk              # Official MCP SDK (v1.4.1; NOT mark3labs/mcp-go)
+github.com/a2aproject/a2a-go/v2                     # A2A protocol v2 (used by remoteagent/v2)
+github.com/a2aproject/a2a-go                        # A2A protocol v1 (deprecated remoteagent v1)
 github.com/openai/openai-go/v3                      # OpenAI SDK (for custom providers)
 ```

@@ -10,6 +10,7 @@
 <!-- Non-breaking spaces are used as a Markdown hack to control column width  -->
 |Skill &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;  | Description |
 |---|---|
+| `cpp-performance` | Guides C++ performance optimization and review, covering benchmarking, `perf`, top-down microarchitecture analysis, flame graphs, cache and allocation tuning, false sharing, NUMA, `std::execution`/OpenMP/oneTBB, PGO/LTO/BOLT/AutoFDO, and compiler remarks. |
 | `geospatial-imagery` | Guides geospatial imagery workflows including format conversion, GDAL operations, OGC protocols (WMS/WMTS/TMS), tile server development, front-end client integration (Cesium, OpenLayers), imagery sourcing, spatial indexing, and performance optimization. |
 | `go-adk` | Guides development of AI agents using Google's [Agent Development Kit](https://github.com/google/adk-go) (ADK) for Go, including multi-agent orchestration, tool definition, MCP integration, and A2A connectivity. |
 | `go-logging` | Guides structured logging implementation in Go web services using `log/slog` and the standard library, including HTTP request logging middleware, log levels, error propagation, security, and production integrations. |

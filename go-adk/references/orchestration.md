@@ -1,6 +1,6 @@
 # Orchestration Patterns
 
-Complete reference for multi-agent orchestration patterns in ADK Go, with full code examples.
+Complete reference for multi-agent orchestration patterns in ADK Go, with full code examples. Verified against `google.golang.org/adk` v1.4.0.
 
 **Import convention:** Pattern 1 shows the full import block. Subsequent patterns show only the new imports they introduce. All patterns assume the common imports from Pattern 1 (`agent`, `llmagent`, `tool`, `genai`, etc.) plus `SKILL.md`'s Key Imports block.
 
@@ -454,13 +454,14 @@ fullWorkflow, _ := sequentialagent.New(sequentialagent.Config{
 Mix local and remote agents. Remote agents (via A2A) are used like any other agent.
 
 ```go
-import "google.golang.org/adk/agent/remoteagent"
+import remoteagent "google.golang.org/adk/agent/remoteagent/v2"
 
-// Remote agent running on another service
+// Remote agent running on another service. The v1 agent/remoteagent package
+// (AgentCardSource field) is deprecated; v2 uses an AgentCardProvider.
 testRunner, _ := remoteagent.NewA2A(remoteagent.A2AConfig{
-    Name:            "TestRunner",
-    Description:     "Runs test suites and reports results.",
-    AgentCardSource: "http://test-service:8001",
+    Name:              "TestRunner",
+    Description:       "Runs test suites and reports results.",
+    AgentCardProvider: remoteagent.NewAgentCardProvider("http://test-service:8001"),
 })
 
 // Local agent

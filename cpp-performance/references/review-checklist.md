@@ -23,10 +23,13 @@ Use this when the repository cannot be built or profiled locally. Mark findings 
 - Are temporary `std::string` or `std::vector` objects created in inner loops?
 - Are values passed by value unnecessarily when they are large?
 - Are there conversions that allocate repeatedly?
+- Do container element types have non-`noexcept` (or suppressed) move constructors, degrading `std::vector` growth to copies? (See `cpp-language-patterns.md`.)
+- Is there a `return std::move(local);` blocking NRVO?
+- Is `std::shared_ptr` copied in a hot path or passed by value where `const&`, `T&`, or `T*` would suffice?
 
 ## 4) Allocation churn
 
-- Are containers grown repeatedly without `reserve`?
+- Are containers grown repeatedly without `reserve`, especially `push_back` loops where the final size is known or boundable up front?
 - Are request-scoped temporaries allocated from the general heap instead of a reusable buffer or arena?
 - Are logging/formatting paths allocating on every hot operation?
 - Does the code allocate on a critical branch?
@@ -52,13 +55,20 @@ Use this when the repository cannot be built or profiled locally. Mark findings 
 - Is aliasing ambiguity preventing vectorization?
 - Are there unpredictable branches in tight loops?
 - Is the loop body too opaque for the optimizer because of abstraction or side effects?
-- Are tiny virtual calls sitting in the hottest loop?
+- Are tiny virtual calls sitting in the hottest loop, with no `final`, devirtualization (LTO/PGO), `std::variant`, or hoisting considered?
+- Is `std::function` used in a hot path where a template parameter or `function_ref` would avoid the indirect call and possible allocation?
 
-## 8) Build configuration
+## 8) I/O and formatting
+
+- Is `std::endl` used in loops where `'\n'` would avoid a flush per line?
+- Would `std::ios::sync_with_stdio(false)` help a stream-heavy program that does not mix C stdio and C++ streams?
+- Are large inputs read char-by-char or line-by-line in tight loops instead of in blocks?
+
+## 9) Build configuration
 
 - Is the project obviously benchmarking Debug builds?
 - Is the profiler build missing symbols?
-- Would frame pointers help the profiling workflow? (Recall upstream GCC/Clang still default to omitting them on `-O1+`.)
+- Would frame pointers help the profiling workflow? Unless the build passes `-fno-omit-frame-pointer` explicitly, assume frame pointers are omitted at `-O1+`; verify on the target rather than assuming distro defaults.
 - Would PGO/LTO be plausible only after source-level fixes?
 - Is `RelWithDebInfo` being treated as `-O3` when it actually defaults to `-O2 -g -DNDEBUG`?
 - Is `-march=native` baked into a portable release build?

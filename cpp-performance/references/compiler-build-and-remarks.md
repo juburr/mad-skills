@@ -25,6 +25,8 @@ target_compile_options(my_target PRIVATE
 )
 ```
 
+`$<CXX_COMPILER_ID:Clang,GNU>` does **not** match `AppleClang` — add it explicitly (`Clang,AppleClang,GNU`) if macOS matters. The comma-list form needs CMake 3.15+.
+
 ### Per-target link flags
 ```cmake
 target_link_options(my_target PRIVATE
@@ -62,10 +64,13 @@ Clang can emit optimization remarks when the compiler:
 - missed a transformation
 - analyzed whether a transformation was possible
 
-Useful starter flags:
+Useful starter flags (quote the regexes — zsh globs them otherwise):
 ```bash
-clang++ -O3 -g   -Rpass=.*   -Rpass-missed=.*   -Rpass-analysis=.*   -fsave-optimization-record   -c foo.cpp -o foo.o
+clang++ -O3 -g '-Rpass=.*' '-Rpass-missed=.*' '-Rpass-analysis=.*' \
+  -fsave-optimization-record -c foo.cpp -o foo.o
 ```
+
+The YAML record lands at `<output-stem>.opt.yaml` (derived from `-o`; `<input>.opt.yaml` only when no `-o` is given), or wherever `-foptimization-record-file=` points. `scripts/collect-compiler-remarks.sh` wraps all of this and gathers the outputs into one directory.
 
 Practical uses:
 - confirm whether a loop vectorized
@@ -89,11 +94,13 @@ g++ -O3 -g \
   -c foo.cpp -o foo.o
 ```
 
-`-fsave-optimization-record` (GCC 9+) writes a gzipped JSON file at `<source>.opt-record.json.gz` — note that GCC emits **JSON**, while Clang emits **YAML** at `<input>.opt.yaml`. Tooling that consumes one rarely consumes the other.
+`-fsave-optimization-record` (GCC 9+) writes a gzipped JSON record that follows GCC's dump-base naming: it lands **next to the `-o` object file**, not next to the source (`-c src/foo.cpp -o build/foo.o` produces `build/foo.cpp.opt-record.json.gz`; without `-o`, the current directory). Redirect it with `-dumpdir <dir>/` (trailing slash significant). Note that GCC emits **JSON** while Clang emits **YAML**; tooling that consumes one rarely consumes the other.
 
-When you need deeper compiler internals:
+Multiple `-fopt-info-*` selectors combine on stderr; only their `=<file>` forms conflict (the first filename wins and GCC warns about the rest).
+
+`-fdump-passes` only lists which passes are enabled (to stderr) — for actual pass internals use the per-pass dumps:
 ```bash
-g++ -O3 -g -fdump-passes -c foo.cpp -o foo.o
+g++ -O3 -g -fdump-tree-vect-details -c foo.cpp -o foo.o   # or -fdump-tree-all, -fdump-rtl-<pass>
 ```
 
 Use these reports to answer questions like:
@@ -104,7 +111,7 @@ Use these reports to answer questions like:
 
 ## Avoid the lazy `-Ofast` reflex
 
-Do not use `-Ofast` as an unexamined default. It changes semantics. If relaxed floating-point behavior is actually acceptable, document that decision and validate numerics. Otherwise, stay with conforming optimization flags.
+Do not use `-Ofast` as an unexamined default. It changes semantics, and Clang 19+ deprecates the spelling outright — write `-O3 -ffast-math` if relaxed floating-point behavior is actually acceptable, document that decision, and validate numerics. Otherwise, stay with conforming optimization flags.
 
 ## PGO
 
@@ -145,6 +152,7 @@ Notes:
 - instrumented binaries must run on representative inputs
 - stale or mismatched profiles can mislead the compiler
 - PGO is most useful when branch probabilities, inlining, and code layout matter
+- GCC writes `.gcda` files at process exit to the absolute paths recorded at compile time (the object directory) — rebuild with `-fprofile-use` in the same tree, or steer with `-fprofile-dir=` / `GCOV_PREFIX`
 
 ### Sample-based PGO (AutoFDO / CSSPGO)
 
@@ -165,9 +173,9 @@ llvm-profgen --binary=code --output=code.prof --perfdata=perf.data
 clang++ -O2 -fprofile-sample-use=code.prof -o code code.cc
 ```
 
-CSSPGO (Context-Sensitive Sampling PGO, LLVM 14+) extends AutoFDO with caller-context awareness via pseudo-probes (`-fpseudo-probe-for-profiling`) and typically recovers most of the gap to instrumented PGO.
+CSSPGO (Context-Sensitive Sampling PGO; landed around LLVM 12, production-usable from roughly LLVM 14) extends AutoFDO with caller-context awareness via pseudo-probes (`-fpseudo-probe-for-profiling`) and typically recovers most of the gap to instrumented PGO.
 
-GCC's equivalent uses `-fauto-profile=<gcov-file>`, with the profile produced by AutoFDO's `create_gcov` tool.
+GCC's equivalent uses `-fauto-profile=<gcov-file>`, with the profile produced by AutoFDO's `create_gcov` tool against the unstripped binary.
 
 ## LTO and ThinLTO
 
@@ -184,7 +192,8 @@ ThinLTO is usually the easier whole-program option when link-time scalability ma
 BOLT (`llvm-bolt`, upstreamed to LLVM in version 14) is a post-link binary rewriter that optimizes code layout and basic-block ordering using a `perf` profile. It runs *after* the linker, on top of an already-optimized PGO+LTO binary.
 
 ```bash
-# 1) build with relocations preserved (required by BOLT)
+# 1) build with relocations preserved (-Wl,-q; strongly recommended — enables
+#    function reordering and full gains. Minimum requirement: unstripped binary.)
 clang++ -O3 -flto -Wl,-q -o code code.cc
 
 # 2) collect a representative profile (LBR strongly preferred on Intel)
@@ -197,12 +206,14 @@ llvm-bolt code -o code.bolt -data=code.fdata \
   -split-all-cold -split-eh -dyno-stats
 ```
 
+`-reorder-functions=cdsort` needs LLVM 17+; use `hfsort` on older releases.
+
 When to reach for BOLT:
 - the binary is large and frontend-bound (icache, iTLB, branch resteers)
 - PGO+LTO are already in place and you need a few more percent
 - you can collect a representative production profile
 
-Reported gains on large binaries (Clang, GCC, server workloads at Meta) range from 5–15% on top of PGO+LTO. Small CPU-bound microbenchmarks rarely benefit.
+Reported gains on top of PGO+LTO: up to ~8% on Meta's data-center workloads and up to ~20% on large compiler binaries (Clang/GCC). Small CPU-bound microbenchmarks rarely benefit.
 
 ## Runtime CPU dispatch (function multi-versioning)
 
@@ -215,13 +226,13 @@ void hot_kernel(float* out, const float* a, const float* b, size_t n) {
 }
 ```
 
-The compiler emits multiple versions and an IFUNC resolver picks the best at load time. Cleaner than `#ifdef` ladders or runtime feature checks for hand-written intrinsics.
+The compiler emits multiple versions and an IFUNC resolver picks the best at load time. Cleaner than `#ifdef` ladders or runtime feature checks for hand-written intrinsics. Support floor: GCC 6+, Clang 14+ (arch-level clone strings like `"arch=x86-64-v3"` need Clang 18+); the IFUNC mechanism requires ELF + glibc, i.e. effectively Linux.
 
 ## `-march=native` and `-march=x86-64-v3`
 
 `-march=native` is useful for local experiments on a known machine. Do not silently bake it into portable release builds unless the deployment target is fixed and documented.
 
-For portable deployment to a known fleet baseline, target a microarchitecture level instead: `-march=x86-64-v2` (SSE4.2), `-march=x86-64-v3` (AVX2 + BMI2), or `-march=x86-64-v4` (AVX-512). Binaries built for a level still crash with SIGILL on older hardware, so verify the floor.
+For portable deployment to a known fleet baseline, target a microarchitecture level instead (GCC 11+/Clang 12+): `-march=x86-64-v2` (SSE4.2), `-march=x86-64-v3` (AVX2 + BMI2), or `-march=x86-64-v4` (AVX-512). Binaries built for a level still crash with SIGILL on older hardware, so verify the floor.
 
 ## What compiler remarks are good for
 

@@ -1,6 +1,6 @@
 ---
 name: cpp-performance
-description: Optimizes C++ for latency, throughput, memory footprint, cache behavior, allocations, contention, vectorization, and parallel scaling. Use when profiling, benchmarking, generating flame graphs, diagnosing false sharing or NUMA issues, tuning PGO/LTO/BOLT/AutoFDO builds, working with OpenMP/oneTBB/std::execution, or performing static performance review.
+description: Guides C++ performance optimization including profiling, benchmarking, memory layout, allocation reduction, parallelism, vectorization, and build tuning (PGO/LTO/BOLT). Use when optimizing C++ code for speed or memory, diagnosing performance regressions, profiling or benchmarking C++ programs, generating flame graphs, fixing false sharing or NUMA scaling issues, working with OpenMP/oneTBB/std::execution, or reviewing C++ code for performance anti-patterns.
 ---
 
 # C++ Performance
@@ -37,11 +37,12 @@ Aim to produce a result that is evidence-driven and easy to review:
    - Use warmup and repetitions. Record compiler, flags, machine, input, and thread count.
 
 4. **Find the real bottleneck**
-   - First triage: on Intel/AMD, run `perf stat -M TopdownL1 -- ./binary` to classify cycles into Frontend Bound, Backend Bound (Memory vs Core), Bad Speculation, and Retiring. The dominant category points at the right reference file.
+   - First triage: classify pipeline slots with top-down analysis — Intel: `perf stat -M TopdownL1 -- ./binary`; AMD Zen 4+: `perf stat -M PipelineL1 -- ./binary`. Level 1 has four buckets: Frontend Bound, Bad Speculation, Backend Bound, Retiring; level 2 (`-M TopdownL2` / `-M PipelineL2`) splits Backend Bound into Memory vs Core. The dominant category points at the right reference file.
    - CPU hotspot: read `references/measurement-and-benchmarking.md` and `references/tool-recipes.md`
    - compiler/codegen issue (Frontend Bound, Bad Speculation): read `references/compiler-build-and-remarks.md`
-   - memory footprint or allocation churn (Backend Bound — Memory): read `references/memory-layout-and-allocations.md`
+   - memory footprint or allocation churn (Backend Bound → Memory at level 2): read `references/memory-layout-and-allocations.md`
    - poor scaling, contention, or false sharing: read `references/parallelism-and-contention.md`
+   - source-level review without running the code: read `references/cpp-language-patterns.md` and `references/review-checklist.md`
 
 5. **Choose the least invasive fix in this order**
    1. algorithm / data structure
@@ -127,7 +128,7 @@ High-value moves:
 Use the concurrency model already present in the codebase unless there is strong evidence to change it.
 
 Choose among these patterns:
-- **`std::execution`** (C++17 `seq`/`par`/`par_unseq`; C++20 added `unseq`) for straightforward data-parallel algorithms
+- **`std::execution`** (C++17 `seq`/`par`/`par_unseq`; C++20 added `unseq`) for straightforward data-parallel algorithms — but verify the library actually parallelizes: libstdc++ needs the TBB backend or it runs serially, and MSVC treats `par_unseq` as `par` (see `references/parallelism-and-contention.md`)
 - **OpenMP** for regular loop nests and reductions
 - **oneTBB** for task decomposition, blocked ranges, pipelines, and work-stealing
 
@@ -168,36 +169,40 @@ If results are unmeasured, explicitly label them as **hypotheses**.
 
 ## Gotchas
 
-- `perf` is primarily a Linux workflow. If unavailable, use the nearest profiler available in the environment, but keep the same measure → change → remeasure loop.
-- `perf record --call-graph fp` needs reliable frame pointers. Upstream GCC/Clang still default to `-fomit-frame-pointer` at `-O1+` on x86-64; only Fedora 38+ and Ubuntu 24.04+ build *distro packages* with frame pointers. User builds still need explicit `-fno-omit-frame-pointer`. Otherwise prefer DWARF or LBR when supported.
-- `std::execution::par_unseq` / `unseq` require vectorization-safe bodies: no mutex acquisition, no non-lockfree atomics, and no calls to standard-library functions that synchronize with other invocations. Memory allocation (`new`/`delete`, `malloc`/`free`) is explicitly permitted — the standard carves allocation/deallocation out of the "vectorization-unsafe" definition. Calling a truly forbidden operation is undefined behavior, not a compile error.
+- `perf` is primarily a Linux workflow. On macOS or Windows, map the same measure → change → remeasure loop onto the native tools (see `references/tool-recipes.md` § Non-Linux platforms).
+- `perf record --call-graph fp` needs reliable frame pointers. GCC/Clang enable `-fomit-frame-pointer` at `-O1+` on x86-64, and only some distros (Fedora 38+, Ubuntu 24.04+, Arch) build packages with frame pointers — verify on the target rather than assume. User builds need explicit `-fno-omit-frame-pointer`. Otherwise prefer DWARF or LBR when supported.
+- `std::execution::par_unseq` / `unseq` require vectorization-safe bodies — no locks, no synchronizing calls. Memory allocation is explicitly permitted, and violations are undefined behavior, not compile errors. Details, standard references, and which standard libraries actually parallelize: `references/parallelism-and-contention.md`.
 - `std::pmr::monotonic_buffer_resource` is **not thread-safe**. Use `synchronized_pool_resource` for multi-threaded callers.
-- `std::hardware_destructive_interference_size` is not ABI-stable. GCC issues `-Winterference-size` if used in a header that crosses TU boundaries. Either hard-code 64 (or 128 for Apple Silicon / Intel adjacent-line prefetch) inside an internal-only TU, or guard with `#ifdef __cpp_lib_hardware_interference_size`.
-- `kernel.perf_event_paranoid=2` (the distro default) is enough for sample-based user-space profiling. PMU event reads (`cycles`, `instructions`) need `=1`; kernel profiling needs `=0` or `-1`.
+- `std::hardware_destructive_interference_size` is not ABI-stable. GCC warns by default (`-Winterference-size`) when it is used in a header. Either hard-code 64 (or 128 for Apple Silicon / Intel adjacent-line prefetch) inside an internal-only TU, or guard with `#ifdef __cpp_lib_hardware_interference_size`.
+- `kernel.perf_event_paranoid=2` (the upstream default) already allows per-process counting and user-space sampling of hardware events (`cycles:u`, `instructions:u`). Kernel profiling needs `<=1`; system-wide monitoring (`perf stat -a`, `perf top`, uncore events) needs `<=0` or root/`CAP_PERFMON`. Debian/Ubuntu kernels raise the default above `2` (3/4), which denies unprivileged perf entirely.
 - Thermal throttling silently ruins benchmarks. Pin governor with `cpupower frequency-set -g performance` and watch `turbostat --interval 1` for `PkgWatt` / `Avg_MHz` excursions during runs.
 - NUMA effects can dominate multisocket scaling. Inspect topology with `numactl --hardware` or `lstopo`.
-- Cachegrind/Callgrind are slow but useful when hardware counters are unavailable or noisy.
+- PMU counters are often unavailable in VMs and containers (`perf stat` shows `<not supported>`). Cachegrind/Callgrind are slow but useful when hardware counters are unavailable or noisy.
 - More aggressive math flags (`-Ofast`, `-ffast-math`) can change numerical behavior. Treat them as semantics changes.
 - Sanitizer-instrumented binaries are correctness tools, not performance baselines.
 
-## Supporting files
+## Reference files
 
 Load only the files relevant to the current bottleneck:
 
-- [references/measurement-and-benchmarking.md](references/measurement-and-benchmarking.md) — baseline design, benchmark hygiene, Google Benchmark, `perf stat`, TMA top-down, hyperfine, pinning, NUMA, thermal throttling
-- [references/compiler-build-and-remarks.md](references/compiler-build-and-remarks.md) — CMake build modes, Clang/GCC optimization remarks, instrumented PGO, AutoFDO/CSSPGO, LTO/ThinLTO, BOLT, function multi-versioning
-- [references/memory-layout-and-allocations.md](references/memory-layout-and-allocations.md) — locality, `std::pmr`, `std::span`, false sharing, allocator alternatives (mimalloc/tcmalloc/jemalloc), flat hash maps, THP, `std::vector<bool>` trap
-- [references/parallelism-and-contention.md](references/parallelism-and-contention.md) — OpenMP, oneTBB, `std::execution`, contention reduction, NUMA tooling, race-checking
-- [references/tool-recipes.md](references/tool-recipes.md) — copy-paste workflows for `perf`, `perf c2c`, `perf mem`, FlameGraph, Valgrind tools, Heaptrack, hyperfine, bloaty, BOLT, `llvm-mca`, coz
-- [references/review-checklist.md](references/review-checklist.md) — static review rubric for code that cannot be run locally
-- [references/source-index.md](references/source-index.md) — curated primary sources behind this skill
+| File | Contents | Load when |
+|---|---|---|
+| `references/measurement-and-benchmarking.md` | Baseline design, benchmark hygiene, Google Benchmark, `perf stat`, TMA top-down, result comparison, pinning, NUMA, thermal throttling | Setting up measurements or interpreting counter data |
+| `references/compiler-build-and-remarks.md` | CMake build modes, Clang/GCC optimization remarks, instrumented PGO, AutoFDO/CSSPGO, LTO/ThinLTO, BOLT, function multi-versioning | Tuning builds or diagnosing missed inlining/vectorization |
+| `references/memory-layout-and-allocations.md` | Locality, `std::pmr`, false sharing, allocator alternatives (mimalloc/tcmalloc/jemalloc), flat hash maps, THP, `std::vector<bool>` trap | Backend Bound → Memory, allocation churn, or footprint work |
+| `references/parallelism-and-contention.md` | OpenMP, oneTBB, `std::execution`, contention reduction, atomics cost, NUMA, race-checking | Poor scaling, contention, or parallelizing code |
+| `references/cpp-language-patterns.md` | Source-level patterns: `noexcept` moves, RVO, `shared_ptr`/`std::function` cost, devirtualization, string/SSO, exceptions, stream I/O | Reviewing or writing hot-path C++ source |
+| `references/tool-recipes.md` | Copy-paste workflows for `perf`, `perf c2c`, `perf mem`, FlameGraph, Valgrind tools, Heaptrack, hyperfine, bloaty, BOLT, `llvm-mca`, coz, non-Linux platforms | Running a specific tool |
+| `references/review-checklist.md` | Static review rubric for code that cannot be run locally | Static performance review |
 
 ## Bundled scripts
 
-These helper scripts are optional. They standardize common workflows and reduce repetitive shell setup.
+Execute these with `bash` (do not inline their contents). They print usage on missing arguments and degrade gracefully when optional tools are absent.
 
-- `scripts/check-tools.sh`
-- `scripts/run-google-benchmark.sh`
-- `scripts/run-perf-stat.sh`
-- `scripts/run-perf-record.sh`
-- `scripts/collect-compiler-remarks.sh`
+| Script | What it does | Run when |
+|---|---|---|
+| `scripts/check-tools.sh` | Reports which profiling tools are installed plus `perf_event_paranoid`, governor, and CPU info | First, to see what the environment supports |
+| `scripts/run-perf-stat.sh <binary> [args]` | Repeated `perf stat` counter summary (env: `PERF_REPEAT`, `PERF_EVENTS`, `CPUSET`, `NUMA_NODE`) | Counter-level triage and before/after comparisons |
+| `scripts/run-perf-record.sh <binary> [args]` | `perf record` + optional FlameGraph SVG (env: `PERF_FREQ`, `PERF_CALLGRAPH`, `FLAMEGRAPH_DIR`, `CPUSET`, `NUMA_NODE`) | Locating CPU hotspots |
+| `scripts/run-google-benchmark.sh <bench-binary>` | Runs a Google Benchmark binary with repetitions, warmup, and JSON output (env: `BENCH_REPS`, `BENCH_WARMUP`, `BENCH_FILTER`) | Microbenchmark runs you want to keep comparable |
+| `scripts/collect-compiler-remarks.sh <clang\|gcc> <out-dir> -- <compile-cmd>` | Wraps one compile command and collects optimization remarks/records into `<out-dir>` | Diagnosing missed inlining/vectorization |

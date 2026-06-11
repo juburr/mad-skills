@@ -20,7 +20,7 @@ Use parallel algorithms when the problem already matches the algorithm library w
 - `std::execution::par_unseq` (C++17): may be parallel **and** vectorized; bodies must be vectorization-safe
 - `std::execution::unseq` (**C++20**, not C++17): may be vectorized but not parallelized
 
-`par_unseq` and `unseq` forbid synchronization primitives in the loop body: mutex lock/unlock, non-lockfree `std::atomic` operations, and standard-library functions that synchronize with other invocations. The normative definition of "vectorization-unsafe" (from P1001R2, folded into the standard) explicitly carves out memory allocation and deallocation — `new`, `delete`, `malloc`, `free`, and `std::allocator::allocate` are **allowed**, even though some secondary docs incorrectly list them. Calling a truly forbidden operation is **undefined behavior**, not a compile error.
+`par_unseq` and `unseq` forbid synchronization primitives in the loop body: mutex lock/unlock, non-lockfree `std::atomic` operations, and standard-library functions that synchronize with other invocations. The normative definition of "vectorization-unsafe" — including its explicit carve-out for memory allocation and deallocation — is C++17 [algorithms.parallel.defns] verbatim (adopted from the Parallelism TS via P0024; P1001R2 only added `unsequenced_policy`/`unseq` in C++20). So `new`, `delete`, `malloc`, `free`, and `std::allocator::allocate` are **allowed**, even though some secondary docs incorrectly list them. The further carve-out for lock-free atomic read-modify-write operations is a current-working-draft (C++26-era) change — under a strict C++17/20 reading even lock-free synchronizing atomics are not formally exempt, though implementations tolerate them. Calling a truly forbidden operation is **undefined behavior**, not a compile error.
 
 Good fits:
 - map/filter/reduce style operations
@@ -34,6 +34,14 @@ Bad fits:
 - tasks needing complex orchestration
 
 When in doubt, start with `par`, not `par_unseq`.
+
+### Which implementations actually parallelize
+
+- **libstdc++** dispatches parallel policies to oneTBB — without TBB available at build time and linked (`-ltbb`), parallel policies compile but run serially
+- **libc++** ships parallel algorithms only as experimental
+- **MSVC** parallelizes `par` but treats `par_unseq` like `par` (no vectorized execution)
+
+Always benchmark to confirm parallel execution actually happened.
 
 ## OpenMP
 
@@ -81,6 +89,9 @@ With:
 - thread-local partial results
 - one merge/reduction phase
 
+### Relaxed ordering for statistics counters
+Statistics counters should use `fetch_add(1, std::memory_order_relaxed)` — the default `seq_cst` RMW adds ordering cost the counter does not need. But relaxed ordering does not fix contention itself: the cache line still bounces between cores. Sharding or thread-local accumulation does.
+
 ### Sharding
 Split a shared structure into multiple independent shards keyed by hash, range, or NUMA node.
 
@@ -98,14 +109,7 @@ Separate the data that all threads read from the data that a few threads mutate 
 
 ## NUMA topology and placement
 
-On multi-socket and large single-socket-with-CCDs systems, remote memory access can dominate scaling beyond a single node. Always inspect topology before drawing conclusions about scaling:
-
-```bash
-numactl --hardware                              # nodes, free memory, distances matrix
-lstopo                                          # full hwloc topology
-numastat -p $(pidof my_app)                     # per-node memory residency for live process
-numactl --cpunodebind=0 --membind=0 -- ./bin    # constrain a run to one node
-```
+On multi-socket and large single-socket-with-CCDs systems, remote memory access can dominate scaling beyond a single node. Always inspect topology before drawing conclusions about scaling — see `tool-recipes.md` for the `numactl` / `lstopo` / `numastat` commands.
 
 Patterns that help:
 - pin worker threads to a single node when the data set fits

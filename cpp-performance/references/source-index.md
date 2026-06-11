@@ -1,5 +1,7 @@
 # Source index
 
+> Maintainer documentation (provenance only) — not meant to be loaded during tasks.
+
 This skill was built from current open documentation and primary sources, with an emphasis on portable agent-skill structure and modern C++ performance tooling.
 
 ## Skill format and compatibility

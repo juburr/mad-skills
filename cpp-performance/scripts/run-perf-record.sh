@@ -22,7 +22,10 @@ script_file="$out_dir/${name}__${timestamp}.script.txt"
 folded_file="$out_dir/${name}__${timestamp}.folded"
 svg_file="$out_dir/${name}__${timestamp}.svg"
 
+# 999 Hz: off-by-one from 1000 Hz to avoid lockstep sampling with kernel timers.
 freq="${PERF_FREQ:-999}"
+# dwarf,16384: user-stack bytes dumped per sample for DWARF unwinding; larger
+# captures deeper stacks but inflates perf.data (max 65528).
 callgraph="${PERF_CALLGRAPH:-dwarf,16384}"
 
 runner=()
@@ -42,13 +45,27 @@ if [[ -n "${CPUSET:-}" ]]; then
   fi
 fi
 
-record_cmd=(perf record -F "${freq}" -g --call-graph "${callgraph}" -o "${data_file}" -- "${runner[@]}" "${program[@]}")
+# --call-graph implies -g, so -g is not passed separately.
+record_cmd=(perf record -F "${freq}" --call-graph "${callgraph}" -o "${data_file}" -- "${runner[@]}" "${program[@]}")
 
 echo "Running perf record:" >&2
 printf '  %q' "${record_cmd[@]}" >&2
 echo >&2
 
-"${record_cmd[@]}"
+# Capture the profiled program's exit status without letting set -e abort us:
+# a failing program may still have produced useful profile data.
+status=0
+"${record_cmd[@]}" || status=$?
+
+if [[ ! -e "$data_file" ]]; then
+  echo "perf record produced no data file (exit status: $status)." >&2
+  # Never exit 0 from this branch even if perf itself reported success.
+  exit "$(( status == 0 ? 1 : status ))"
+fi
+
+if [[ "$status" -ne 0 ]]; then
+  echo "Warning: profiled program exited non-zero (status: $status); continuing with post-processing." >&2
+fi
 
 echo "perf data: $data_file" >&2
 echo "To inspect interactively: perf report -i $data_file" >&2
@@ -64,3 +81,5 @@ if [[ -n "${FLAMEGRAPH_DIR:-}" ]] && [[ -x "${FLAMEGRAPH_DIR}/stackcollapse-perf
 else
   echo "FLAMEGRAPH_DIR not set (or scripts not executable); skipping flame graph generation." >&2
 fi
+
+exit "$status"

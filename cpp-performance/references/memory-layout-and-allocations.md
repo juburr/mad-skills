@@ -33,8 +33,6 @@ Benefits:
 - often fewer allocations
 
 ### SoA vs AoS
-If a loop touches only a subset of fields, structure-of-arrays can reduce wasted bandwidth.
-
 Prefer SoA when:
 - kernels scan one or two fields across many objects
 - vectorization matters
@@ -46,17 +44,10 @@ Prefer AoS when:
 
 ## Non-owning views
 
-### `std::span`
-Use `std::span<T>` to express a non-owning contiguous range.
-It often removes the need to copy or materialize temporary vectors just to pass size + pointer together.
-
-### `std::string_view`
-Use `std::string_view` for read-only string-like inputs when ownership does not need to transfer.
-
-Caveats:
-- it is non-owning; lifetime bugs are easy to introduce
-- it is not guaranteed to be null-terminated
-- if you construct from `const char*` without a size, a length scan may be needed; if you already know the size, pass it
+- Accept `std::span<T>` / `std::string_view` at API boundaries instead of forcing callers to materialize a `std::vector` or `std::string` — removes copies and temporary allocations
+- Both are non-owning; lifetime bugs are easy to introduce (never bind a view to a temporary that dies before use)
+- `std::string_view` is not null-terminated; passing one to a `const char*` API may force a copy back to an owning string
+- Constructing `string_view` from a bare `const char*` triggers a length scan — pass the size when you already know it
 
 ## Allocation reduction
 
@@ -120,7 +111,7 @@ Mitigations:
 
 ### `std::hardware_destructive_interference_size` is not ABI-stable
 
-C++17 added `std::hardware_destructive_interference_size`, but using it casually creates an ABI hazard: the value depends on `-mtune` and varies across platforms (libstdc++ uses 64 on x86-64, but Apple Silicon and some Intel adjacent-line prefetchers want 128). GCC emits `-Winterference-size` (on with `-Wall`/`-Wextra`) when you use it in a declaration that crosses TU boundaries.
+C++17 added `std::hardware_destructive_interference_size`, but using it casually creates an ABI hazard: the value depends on `-mtune` and varies across platforms (libstdc++ uses 64 on x86-64, but Apple Silicon and some Intel adjacent-line prefetchers want 128). GCC emits `-Winterference-size` (enabled by default) when the variable is used in a header file; silence it with `-Wno-interference-size`, or pin the value with `--param destructive-interference-size=64`.
 
 Safe patterns:
 
@@ -155,17 +146,15 @@ oneTBB provides:
 - `scalable_allocator<T>` for allocator scalability bottlenecks
 - `cache_aligned_allocator<T>` when alignment and interference matter
 
-Do not change allocators blindly. If allocation volume is the real problem, a faster allocator may only mask it.
-
 ### Process-wide allocator replacement
 
 When the bottleneck is glibc `malloc` contention or fragmentation under high allocation rates, swapping the global allocator is often a 5–30% win with zero code changes. Test via `LD_PRELOAD` first, then bake into the build if it sticks.
 
 | Allocator | Strengths | Notes |
 |---|---|---|
-| **mimalloc** (Microsoft) | Fast small-allocation path; low fragmentation; transparent huge page support | Often wins on small-allocation-heavy workloads. `LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libmimalloc.so.2` |
+| **mimalloc** (Microsoft) | Fast small-allocation path; low fragmentation; transparent huge page support | Often wins on small-allocation-heavy workloads. `LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libmimalloc.so.2` (path is distro-specific; shown for Debian/Ubuntu) |
 | **tcmalloc** (gperftools / google/tcmalloc) | Strong throughput; large-allocation friendly; integrates with gperftools heap profiler | Two flavors exist — gperftools tcmalloc (older, packaged in distros) and google/tcmalloc (newer, requires Bazel/Abseil) |
-| **jemalloc** | Excellent multi-arena scaling; low tail latency on long-running servers; mature MALLCTL knobs and built-in profiling | The default for many databases (Redis, Aerospike, Cassandra historically). `MALLOC_CONF=background_thread:true,metadata_thp:auto` is a common starting tune |
+| **jemalloc** | Excellent multi-arena scaling; low tail latency on long-running servers; mature `mallctl` knobs and built-in profiling | The default for many databases (Redis, Aerospike, Cassandra historically). `MALLOC_CONF=background_thread:true,metadata_thp:auto` is a common starting tune. Status: upstream development halted and the repo was archived mid-2025; Meta has since resumed maintenance (5.3.1 released 2026) — evaluate the maintenance trajectory before adopting |
 
 A faster allocator does not fix excessive allocation volume — it only masks it. Reduce allocation rate first; swap the allocator second.
 
@@ -177,8 +166,8 @@ A faster allocator does not fix excessive allocation volume — it only masks it
 |---|---|---|
 | `absl::flat_hash_map` / `absl::flat_hash_set` | Abseil | General drop-in replacement; SwissTable design; values are not pointer-stable |
 | `boost::unordered_flat_map` | Boost.Unordered (1.81+) | Same niche as absl; available without an Abseil dependency |
-| `ankerl::unordered_dense::map` | header-only (martinus/unordered_dense) | Fastest in many benchmarks; values stored in a contiguous vector |
-| `tsl::robin_map` / `tsl::hopscotch_map` | header-only (Tessil) | Good when iteration order or load-factor tuning matters |
+| `ankerl::unordered_dense::map` | header-only (martinus/unordered_dense) | Fastest in many benchmarks; values stored in a contiguous vector — no pointer stability, and erase reorders elements |
+| `tsl::robin_map` / `tsl::hopscotch_map` | header-only (Tessil) | Tolerates high load factors; open addressing, so modifying operations invalidate iterators. If iteration order matters, use `tsl::ordered_map` |
 
 Reach for the node-based `std::unordered_map` only when callers actually depend on reference stability across rehashes.
 

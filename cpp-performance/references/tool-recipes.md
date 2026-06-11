@@ -10,7 +10,8 @@ All `scripts/...` paths below are relative to the `cpp-performance` skill direct
 # Pick the path that matches your install:
 export SKILL_DIR="$HOME/.claude/skills/cpp-performance"           # Claude Code
 # export SKILL_DIR="$HOME/.codex/skills/cpp-performance"          # Codex
-# export SKILL_DIR="$HOME/go/src/github.com/juburr/mad-skills/cpp-performance"  # repo checkout
+# export SKILL_DIR="$HOME/.gemini/skills/cpp-performance"         # Gemini CLI
+# export SKILL_DIR="<path-to-skill-checkout>/cpp-performance"     # repo checkout
 ```
 
 If you'd rather not set a variable, `cd "$SKILL_DIR"` once and drop the `"$SKILL_DIR"/` prefix in the commands. Every command below fails with `No such file or directory` if `$SKILL_DIR` is unset.
@@ -79,18 +80,18 @@ perf script -i perf.data \
   | /path/to/FlameGraph/flamegraph.pl > flamegraph.svg
 ```
 
-Recent `perf` (6.x) also ships a built-in shortcut: `perf script report flamegraph` produces an HTML flame graph without external scripts.
+`perf` 5.8+ also ships a built-in shortcut: `perf script report flamegraph` writes `flamegraph.html` without external scripts. Requires perf built with Python scripting plus the d3-flame-graph template (distro package, e.g. `libjs-d3-flame-graph`) or `--allow-download`.
 
 ## `perf c2c`: false sharing and cache-line contention
 
 ```bash
-perf c2c record -- ./build/bin/my_app --input corpus.txt
-perf c2c report -NN -g --call-graph=dwarf
+perf c2c record --call-graph dwarf -- ./build/bin/my_app --input corpus.txt
+perf c2c report -NN
 ```
 
 Look at the **Shared Data Cache Line Table** for lines with the highest HITM (load that hit a modified line in another core's cache). The **Shared Cache Line Distribution Pareto** shows the offsets within each contended line, which usually points straight at the offending struct fields.
 
-`perf c2c` works on Intel (load-latency / precise-store), recent AMD (IBS, except Zen 3 — unsupported), PowerPC (random instruction sampling), and Arm64 (SPE).
+Per perf-c2c(1), `perf c2c` works on Intel (load-latency / precise-store), recent AMD (IBS, except Zen 3 — unsupported), PowerPC (random instruction sampling), and Arm64 (SPE).
 
 ## `perf mem`: memory access sampling
 
@@ -103,13 +104,15 @@ Reports the source location of loads/stores along with the cache level that sati
 
 ## Memory bandwidth measurement
 
-For DRAM bandwidth, use Intel PCM (`pcm-memory.x`, Apache-licensed) or `perf` uncore counters:
+For DRAM bandwidth, use Intel PCM (`pcm-memory`, BSD-licensed) or `perf` uncore counters:
 
 ```bash
-sudo pcm-memory.x 1                                          # interval seconds
-sudo perf stat -e 'uncore_imc_*/cas_count_read/,uncore_imc_*/cas_count_write/' \
+sudo pcm-memory 1                                            # interval seconds
+sudo perf stat -a -e 'uncore_imc_*/cas_count_read/,uncore_imc_*/cas_count_write/' \
   -- ./build/bin/my_app
 ```
+
+Uncore PMUs cannot count per-task; `perf` rejects them without `-a` (system-wide), so the counts cover whole-socket traffic — keep the machine otherwise idle. The `cas_count` events exist on Intel server parts; client parts expose `uncore_imc/data_reads/` etc.
 
 A STREAM benchmark (`stream_c.exe`) gives a portable upper bound for the machine's sustainable bandwidth — compare your workload's measured rate to that ceiling. If you're within ~70%, more compute parallelism cannot help.
 
@@ -130,21 +133,13 @@ bloaty -d sections ./build/bin/my_app
 bloaty ./build-after/bin/my_app -- ./build-before/bin/my_app   # diff two builds
 ```
 
-Use when chasing icache pressure, template bloat, LTO size regressions, or unexpectedly large debug sections.
+Use when chasing icache pressure, template bloat, LTO size regressions, or unexpectedly large debug sections. `-d compileunits` requires debug info.
 
-## Clang optimization remarks
+## Compiler optimization remarks
 
-```bash
-clang++ -O3 -g   -Rpass=.* -Rpass-missed=.* -Rpass-analysis=.*   -fsave-optimization-record   -c foo.cpp -o foo.o
-```
+Clang `-Rpass*` and GCC `-fopt-info*` flag sets live in `compiler-build-and-remarks.md` — that file is the single home for them.
 
-## GCC optimization remarks
-
-```bash
-g++ -O3 -g   -fopt-info   -fopt-info-vec-missed   -fsave-optimization-record   -c foo.cpp -o foo.o
-```
-
-## Bundled helper to collect remarks for a one-off compile command
+### Bundled helper to collect remarks for a one-off compile command
 
 ```bash
 bash "$SKILL_DIR"/scripts/collect-compiler-remarks.sh clang out -- \
@@ -214,10 +209,11 @@ valgrind --tool=dhat ./build/bin/my_app
 
 ```bash
 heaptrack ./build/bin/my_app
-heaptrack_gui heaptrack.*.gz
+heaptrack_gui heaptrack.my_app.*        # current builds write .zst, older ones .gz
+heaptrack_print heaptrack.my_app.*      # no-GUI analyzer
 ```
 
-If the GUI is unavailable, keep the capture and analyze it later on a workstation with the GUI installed.
+If the GUI is unavailable, use `heaptrack_print`, or keep the capture and analyze it later on a workstation with the GUI installed.
 
 ## `llvm-mca`
 
@@ -252,13 +248,32 @@ llvm-bolt code -o code.bolt -data=code.fdata \
   -split-functions -split-all-cold -split-eh -dyno-stats
 ```
 
-Use after PGO+LTO on large, frontend-bound binaries. See `compiler-build-and-remarks.md` for context.
+Use after PGO+LTO on large, frontend-bound binaries. `-reorder-functions=cdsort` needs LLVM 17+; use `hfsort` on older releases. See `compiler-build-and-remarks.md` for context.
 
 ## Causal profiling: `coz`
 
 ```bash
-clang++ -O2 -g -ldl -lcoz code.cc -o code
+clang++ -O2 -g code.cc -o code
 coz run --- ./code --realistic-input
 ```
 
+Do not link `-lcoz`; `coz run` injects libcoz itself, and linking it breaks the build. `-ldl` is only needed when using the `COZ_PROGRESS` progress-point macros.
+
 `coz` answers "which function's speedup would actually shorten end-to-end latency?" by running virtual-speedup experiments on selected lines/functions. Especially useful when traditional CPU profiles point at code that is actually waiting on something else.
+
+## Non-Linux platforms
+
+The recipes above are Linux-centric. Map the same workflow — sample CPU, attribute heap, optimize the build — onto these tools:
+
+| Need | macOS | Windows |
+|---|---|---|
+| CPU sampling | Instruments (Time Profiler), `xctrace`, samply | Visual Studio profiler, Intel VTune, ETW (wpr/WPA), AMD uProf |
+| Heap attribution | Instruments (Allocations) | Visual Studio heap profiler, ETW |
+| Optimized build | clang `-O3 -g` as usual | MSVC `/O2 /Zi /GL /LTCG` |
+| PGO | clang `-fprofile-generate`/`-fprofile-use` | link `/GENPROFILE`, run training, relink `/USEPROFILE` |
+
+macOS CLI capture:
+```bash
+xctrace record --template 'Time Profiler' --launch -- ./app
+samply record ./app        # sampling profiler with Firefox Profiler UI; also runs on Linux/Windows
+```

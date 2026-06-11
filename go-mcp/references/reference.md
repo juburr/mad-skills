@@ -2,6 +2,8 @@
 
 Complete type reference, transport details, session management, and advanced patterns for the official MCP Go SDK.
 
+> Verified against SDK v1.6.1.
+
 ## Core Types
 
 ### Server and Client
@@ -38,6 +40,8 @@ type ServerOptions struct {
     SubscribeHandler            func(context.Context, *mcp.SubscribeRequest) error
     UnsubscribeHandler          func(context.Context, *mcp.UnsubscribeRequest) error
     Capabilities                *mcp.ServerCapabilities  // overrides inferred capabilities
+    SchemaCache                 *mcp.SchemaCache  // share via mcp.NewSchemaCache() across per-request servers
+    GetSessionID                func() string     // custom session IDs (e.g., globally unique for distributed servers)
 }
 ```
 
@@ -73,7 +77,7 @@ type ClientOptions struct {
 | Resource | — | `func(context.Context, *ReadResourceRequest) (*ReadResourceResult, error)` |
 | Prompt | — | `func(context.Context, *GetPromptRequest) (*GetPromptResult, error)` |
 
-The generic tool handler's `Input` struct generates the JSON schema automatically from struct field tags. If the handler returns `(nil, output, nil)`, the SDK marshals the output. If it returns `(*CallToolResult{...}, _, nil)`, the explicit result takes precedence.
+The generic tool handler's `Input` struct generates the JSON schema automatically from struct field tags. If the handler returns `(nil, output, nil)`, the SDK marshals the output. If it returns `(*CallToolResult{...}, output, nil)`, the explicit result is used as the base, but a non-nil typed output still overwrites its `StructuredContent`, and `Content` is auto-filled only if nil.
 
 ## Content Types
 
@@ -84,8 +88,8 @@ All implement the `Content` interface:
 | `TextContent` | `Text string` |
 | `ImageContent` | `Data []byte`, `MIMEType string` |
 | `AudioContent` | `Data []byte`, `MIMEType string` |
-| `EmbeddedResource` | `URI string`, `MIMEType string`, `Data []byte` |
-| `ResourceLink` | `URI string`, `MIMEType string` |
+| `EmbeddedResource` | `Resource *ResourceContents` (URI/MIMEType/Text/Blob live on the nested `ResourceContents`) |
+| `ResourceLink` | `URI string`, `Name string`, `MIMEType string` |
 
 ## Tool Result
 
@@ -101,7 +105,7 @@ type CallToolResult struct {
 Helper methods:
 
 ```go
-result.SetError(err)     // sets IsError=true and Content to error text
+result.SetError(err)     // sets IsError=true; fills Content with the error text only if Content is empty
 err := result.GetError() // returns error if IsError is true
 ```
 
@@ -131,7 +135,7 @@ type GetPromptResult struct {
 }
 
 type PromptMessage struct {
-    Role    string   // "user" or "assistant"
+    Role    Role     // type Role string; "user" or "assistant" (string literals work)
     Content Content  // TextContent, ImageContent, etc.
 }
 ```
@@ -180,6 +184,7 @@ Spawns a subprocess and communicates via its stdin/stdout.
     HTTPClient:           customHTTPClient,   // optional: for auth, mTLS
     MaxRetries:           5,                  // default 5; negative to disable
     DisableStandaloneSSE: false,              // true to disable standalone SSE stream
+    OAuthHandler:         oauthHandler,       // optional: auth.OAuthHandler for OAuth-protected servers
 }
 ```
 
@@ -204,6 +209,12 @@ handler := mcp.NewStreamableHTTPHandler(getServer, &mcp.StreamableHTTPOptions{
 | `SessionTimeout` | Controls how long idle sessions survive before cleanup. |
 | `DisableLocalhostProtection: true` | Only when testing behind a reverse proxy that obscures the client address. |
 
+Cross-origin protection is **not** applied by default. The `CrossOriginProtection` field on `StreamableHTTPOptions` is deprecated — instead, wrap the handler:
+
+```go
+protected := http.NewCrossOriginProtection().Handler(handler)
+```
+
 For the client transport, configure retries and SSE behavior:
 
 ```go
@@ -223,7 +234,9 @@ The `getServer` callback `func(req *http.Request) *mcp.Server` is called per-req
 ```go
 handler := mcp.NewSSEHandler(
     func(req *http.Request) *mcp.Server { return server },
-    &mcp.SSEOptions{},  // currently empty; reserved for future options
+    &mcp.SSEOptions{
+        DisableLocalhostProtection: false,  // DNS rebinding protection, on by default
+    },
 )
 ```
 
@@ -283,7 +296,8 @@ session.Close() error
 session.Wait() error
 
 // Server-to-client calls
-session.CreateMessage(ctx, params)   // request sampling
+session.CreateMessage(ctx, &mcp.CreateMessageParams{...})                   // request sampling
+session.CreateMessageWithTools(ctx, &mcp.CreateMessageWithToolsParams{...}) // sampling with tool use
 session.Elicit(ctx, params)          // request user input
 session.ListRoots(ctx, params)       // list client roots
 session.Log(ctx, params)             // send log message
@@ -412,8 +426,10 @@ server := mcp.NewServer(impl, &mcp.ServerOptions{
     CompletionHandler: func(ctx context.Context, req *mcp.CompleteRequest) (*mcp.CompleteResult, error) {
         // Return completion suggestions
         return &mcp.CompleteResult{
-            Completion: mcp.CompletionResult{
-                Values: []string{"option-a", "option-b"},
+            Completion: mcp.CompletionResultDetails{
+                Values:  []string{"option-a", "option-b"},
+                HasMore: false,  // true if more than 100 matches exist
+                Total:   2,      // optional: total number of matches
             },
         }, nil
     },
@@ -517,6 +533,40 @@ if result.StructuredContent != nil {
 }
 ```
 
+## Schema Customization (Enums, Ranges)
+
+Struct tags cannot express enums or numeric ranges. Keep the typed generic handler and customize the inferred schema with `jsonschema.For` (from `github.com/google/jsonschema-go/jsonschema`):
+
+```go
+type WeatherType string
+const (
+    Sunny  WeatherType = "sunny"
+    Cloudy WeatherType = "cloudy"
+)
+
+type WeatherInput struct {
+    Type WeatherType `json:"type"`
+    Days int         `json:"days"`
+}
+
+customSchemas := map[reflect.Type]*jsonschema.Schema{
+    reflect.TypeFor[WeatherType](): {Type: "string", Enum: []any{Sunny, Cloudy}},
+}
+in, err := jsonschema.For[WeatherInput](&jsonschema.ForOptions{TypeSchemas: customSchemas})
+if err != nil {
+    log.Fatal(err)
+}
+
+// Tweak inferred fields directly:
+in.Properties["days"].Minimum = jsonschema.Ptr(0.0)
+in.Properties["days"].Maximum = jsonschema.Ptr(10.0)
+
+mcp.AddTool(server, &mcp.Tool{
+    Name:        "weather",
+    InputSchema: in,  // overrides default inference; OutputSchema works the same way
+}, weatherHandler)
+```
+
 ## Protected Resource Metadata (RFC 9728)
 
 Publish OAuth metadata at the well-known endpoint:
@@ -536,13 +586,56 @@ http.Handle("/.well-known/oauth-protected-resource", metadataHandler)
 
 ### Client-Side OAuth
 
-Client-side OAuth support (e.g., authorization code flow) requires the `mcp_go_client_oauth` build tag:
+Since v1.5.0, no build tag is required and these APIs are covered by the SDK's backward-compatibility guarantee. (Older docs mention a `mcp_go_client_oauth` build tag; it no longer exists. The README's "experimental" footnote predates v1.5.0.) Set an `auth.OAuthHandler` on the client transport:
 
-```bash
-go build -tags mcp_go_client_oauth ./...
+```go
+type OAuthHandler interface {
+    TokenSource(ctx context.Context) (oauth2.TokenSource, error)
+    Authorize(ctx context.Context, req *http.Request, resp *http.Response) error
+}
 ```
 
-The `oauthex` package provides helpers for dynamic client registration and other OAuth extensions. Without the build tag, these types are not compiled.
+**Authorization code flow** (interactive clients):
+
+```go
+handler, err := auth.NewAuthorizationCodeHandler(&auth.AuthorizationCodeHandlerConfig{
+    // Client registration: at least ONE of these three must be set.
+    // When multiple are set, they are attempted in this order:
+    ClientIDMetadataDocumentConfig: &auth.ClientIDMetadataDocumentConfig{URL: cimdURL}, // non-root HTTPS URL
+    PreregisteredClient:            &oauthex.ClientCredentials{ClientID: id},
+    DynamicClientRegistrationConfig: &auth.DynamicClientRegistrationConfig{ // RFC 7591
+        Metadata: &oauthex.ClientRegistrationMetadata{
+            ClientName:   "my-client",
+            RedirectURIs: []string{"http://localhost:8089/callback"}, // required for DCR
+        },
+    },
+    // Required unless inferred from DCR RedirectURIs; with DCR set, must be in that list.
+    RedirectURL: "http://localhost:8089/callback",
+    // Called with the authorization URL; returns the code and state after user consent
+    AuthorizationCodeFetcher: func(ctx context.Context, args *auth.AuthorizationArgs) (*auth.AuthorizationResult, error) {
+        openBrowser(args.URL)
+        code, state := waitForCallback()
+        return &auth.AuthorizationResult{Code: code, State: state}, nil
+    },
+    Client: customHTTPClient, // optional; defaults to http.DefaultClient
+})
+
+session, err := client.Connect(ctx, &mcp.StreamableClientTransport{
+    Endpoint:     "https://api.example.com/mcp",
+    OAuthHandler: handler,
+}, nil)
+```
+
+**Service-to-service** (client credentials grant) and **Enterprise Managed Authorization** (SEP-990 token exchange) live in `auth/extauth`:
+
+```go
+import "github.com/modelcontextprotocol/go-sdk/auth/extauth"
+
+handler, err := extauth.NewClientCredentialsHandler(...)  // OAuth 2.0 client credentials
+handler, err := extauth.NewEnterpriseHandler(...)         // ID token → ID-JAG exchange (RFC 8693)
+```
+
+Lower-level `oauthex` helpers: `GetAuthServerMeta` (RFC 8414 metadata), `GetProtectedResourceMetadata`, `RegisterClient` (dynamic client registration), `ParseWWWAuthenticate`, `ExchangeToken` (RFC 8693).
 
 ## Logging Integration
 

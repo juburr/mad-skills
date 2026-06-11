@@ -8,11 +8,15 @@ description: Guides development of MCP servers and clients in Go using the offic
 
 # MCP Go
 
+> **Verified against SDK v1.6.1** (released 2026-05-22). Supports MCP spec versions 2025-11-25, 2025-06-18, 2025-03-26, and 2024-11-05. Requires Go 1.25+. If your knowledge of this SDK predates v1.5, read `references/version-notes.md` first — several defaults and patterns changed.
+
 The official Go SDK for the Model Context Protocol (`github.com/modelcontextprotocol/go-sdk/mcp`). Do **not** use the third-party `github.com/mark3labs/mcp-go` package. If migrating from `mark3labs/mcp-go`, read `references/migration-from-mark3labs.md`. Both libraries are wire-compatible: an official SDK client works with a mark3labs server (and vice versa) across all transports, so you can migrate incrementally. The one edge case is legacy SSE transport error handling — mark3labs returns JSON-RPC-formatted errors on the HTTP POST endpoint while the official SDK returns plain text, which may affect clients that parse POST error responses as JSON-RPC. This stems from the 2024-11-05 SSE spec being silent on POST error formatting; neither implementation is wrong.
 
 ```bash
-go get github.com/modelcontextprotocol/go-sdk@latest
+go get github.com/modelcontextprotocol/go-sdk@v1.6.1
 ```
+
+Pin an explicit version rather than `@latest`, especially for air-gapped module mirrors. Newer versions are fine — the SDK guarantees no breaking API changes within v1.
 
 Most MCP protocol types are in the `mcp` package. Auth helpers are in `auth` and `oauthex`. Custom transport authors will also use `jsonrpc`.
 
@@ -55,12 +59,13 @@ mcp.AddTool(server, &mcp.Tool{
 }, search)
 ```
 
-Non-generic form (manual argument parsing):
+Non-generic form (manual argument parsing). `InputSchema` is **required** here — `server.AddTool` panics if it is nil. For a tool with no input, use `{"type": "object"}`:
 
 ```go
 server.AddTool(&mcp.Tool{
     Name:        "ping",
     Description: "Health check.",
+    InputSchema: map[string]any{"type": "object"},
 }, func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
     return &mcp.CallToolResult{
         Content: []mcp.Content{&mcp.TextContent{Text: "pong"}},
@@ -153,7 +158,20 @@ http.Handle("/mcp", handler)
 log.Fatal(http.ListenAndServe(":8080", nil))
 ```
 
-The `getServer` callback receives the HTTP request, enabling per-request server instances (e.g., different tools per tenant).
+The `getServer` callback receives the HTTP request, enabling per-request server instances (e.g., different tools per tenant). When creating a new `*mcp.Server` per request, share a schema cache across instances to avoid re-deriving tool schemas via reflection on every request:
+
+```go
+cache := mcp.NewSchemaCache() // create once, share across all servers
+handler := mcp.NewStreamableHTTPHandler(func(req *http.Request) *mcp.Server {
+    return mcp.NewServer(impl, &mcp.ServerOptions{SchemaCache: cache})
+}, nil)
+```
+
+### HTTP Security Defaults
+
+- **DNS rebinding protection is on by default**: requests arriving via localhost with a non-localhost `Host` header are rejected with 403. Opt out with `StreamableHTTPOptions.DisableLocalhostProtection` (also on `SSEOptions`).
+- **Cross-origin protection is off by default** (since v1.6.0). To enable it, wrap the handler: `http.NewCrossOriginProtection().Handler(mcpHandler)`. Do not use the deprecated `StreamableHTTPOptions.CrossOriginProtection` field.
+- **POST requests must have `Content-Type: application/json`**; the escape hatch is `MCPGODEBUG=disablecontenttypecheck=1` (see `references/version-notes.md` for all `MCPGODEBUG` flags).
 
 ### Adding MCP to an Existing HTTP Service
 
@@ -248,7 +266,7 @@ For true protocol-level errors (that should not reach the LLM), return a `*jsonr
 ```go
 import "github.com/modelcontextprotocol/go-sdk/jsonrpc"
 
-return nil, nil, &jsonrpc.Error{Code: jsonrpc.InternalError, Message: "internal failure"}
+return nil, nil, &jsonrpc.Error{Code: jsonrpc.CodeInternalError, Message: "internal failure"}
 ```
 
 ### Resource Not Found
@@ -279,9 +297,9 @@ server.AddReceivingMiddleware(func(next mcp.MethodHandler) mcp.MethodHandler {
 })
 ```
 
-### Sending Middleware (Outgoing Responses)
+### Sending Middleware (Outgoing Requests)
 
-Use for tracing, response transformation:
+Wraps requests and notifications this side *sends* (e.g., server-to-client `CreateMessage`, list-changed notifications) — not responses to incoming requests. Use for tracing, metrics, adding progress tokens:
 
 ```go
 server.AddSendingMiddleware(func(next mcp.MethodHandler) mcp.MethodHandler {
@@ -332,6 +350,30 @@ func myTool(ctx context.Context, req *mcp.CallToolRequest, input MyInput) (*mcp.
     // Use tenantID for RLS, scoping queries, etc.
 }
 ```
+
+### Client-Side OAuth
+
+Clients connecting to OAuth-protected servers set an `OAuthHandler` on the transport (no build tag required since v1.5.0):
+
+```go
+handler, err := auth.NewAuthorizationCodeHandler(&auth.AuthorizationCodeHandlerConfig{
+    // At least one registration method is required: DynamicClientRegistrationConfig,
+    // PreregisteredClient, or ClientIDMetadataDocumentConfig.
+    DynamicClientRegistrationConfig: &auth.DynamicClientRegistrationConfig{
+        Metadata: &oauthex.ClientRegistrationMetadata{
+            ClientName:   "my-client",
+            RedirectURIs: []string{"http://localhost:8089/callback"},
+        },
+    },
+    AuthorizationCodeFetcher: fetcher, // opens browser, returns code+state
+})
+session, err := client.Connect(ctx, &mcp.StreamableClientTransport{
+    Endpoint:     "https://api.example.com/mcp",
+    OAuthHandler: handler,
+}, nil)
+```
+
+For service-to-service auth, use `extauth.NewClientCredentialsHandler` from `auth/extauth`. See `references/reference.md` for the full client OAuth surface.
 
 ### JWT Passthrough to Downstream Services
 
@@ -393,6 +435,7 @@ Log levels follow RFC 5424: debug, info, notice, warning, error, critical, alert
 
 | File | Contents | Load when |
 |---|---|---|
-| `references/reference.md` | Complete type reference, all transport options, session management, event stores, structured output, advanced middleware patterns, testing with in-memory transports | Looking up specific types, writing tests, or implementing advanced patterns |
+| `references/reference.md` | Complete type reference, all transport options, session management, event stores, structured output, schema customization, client-side OAuth, advanced middleware patterns, testing with in-memory transports | Looking up specific types, writing tests, or implementing advanced patterns |
 | `references/migration-from-mark3labs.md` | Step-by-step migration from `mark3labs/mcp-go` to the official SDK, with before/after code for every concept, type mapping table, and known gotchas | Migrating an existing codebase from mark3labs/mcp-go |
 | `references/security-labels.md` | Sensitivity metadata in `_meta`, high-water-mark rollup, mTLS configuration, JWT passthrough for RLS, sensitivity middleware | Implementing data sensitivity labeling, JWT-based row-level security, or mTLS for MCP servers |
+| `references/version-notes.md` | SDK release history v1.0.0–v1.6.1: behavior changes, new APIs per release, `MCPGODEBUG` compatibility flags, stale patterns to avoid | Working with a different SDK version, debugging version-specific behavior, or your SDK knowledge may be outdated |

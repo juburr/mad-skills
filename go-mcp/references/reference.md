@@ -599,12 +599,17 @@ type OAuthHandler interface {
 
 ```go
 handler, err := auth.NewAuthorizationCodeHandler(&auth.AuthorizationCodeHandlerConfig{
-    // Client registration, attempted in order:
-    ClientIDMetadataDocumentConfig:  &auth.ClientIDMetadataDocumentConfig{URL: cimdURL}, // optional
-    PreregisteredClient:             &oauthex.ClientCredentials{ClientID: id},           // optional
-    DynamicClientRegistrationConfig: &auth.DynamicClientRegistrationConfig{              // optional (RFC 7591)
-        Metadata: &oauthex.ClientRegistrationMetadata{ClientName: "my-client"},
+    // Client registration: at least ONE of these three must be set.
+    // When multiple are set, they are attempted in this order:
+    ClientIDMetadataDocumentConfig: &auth.ClientIDMetadataDocumentConfig{URL: cimdURL}, // non-root HTTPS URL
+    PreregisteredClient:            &oauthex.ClientCredentials{ClientID: id},
+    DynamicClientRegistrationConfig: &auth.DynamicClientRegistrationConfig{ // RFC 7591
+        Metadata: &oauthex.ClientRegistrationMetadata{
+            ClientName:   "my-client",
+            RedirectURIs: []string{"http://localhost:8089/callback"}, // required for DCR
+        },
     },
+    // Required unless inferred from DCR RedirectURIs; with DCR set, must be in that list.
     RedirectURL: "http://localhost:8089/callback",
     // Called with the authorization URL; returns the code and state after user consent
     AuthorizationCodeFetcher: func(ctx context.Context, args *auth.AuthorizationArgs) (*auth.AuthorizationResult, error) {
@@ -612,7 +617,7 @@ handler, err := auth.NewAuthorizationCodeHandler(&auth.AuthorizationCodeHandlerC
         code, state := waitForCallback()
         return &auth.AuthorizationResult{Code: code, State: state}, nil
     },
-    Client: customHTTPClient, // optional
+    Client: customHTTPClient, // optional; defaults to http.DefaultClient
 })
 
 session, err := client.Connect(ctx, &mcp.StreamableClientTransport{

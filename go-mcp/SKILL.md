@@ -357,7 +357,14 @@ Clients connecting to OAuth-protected servers set an `OAuthHandler` on the trans
 
 ```go
 handler, err := auth.NewAuthorizationCodeHandler(&auth.AuthorizationCodeHandlerConfig{
-    RedirectURL:              "http://localhost:8089/callback",
+    // At least one registration method is required: DynamicClientRegistrationConfig,
+    // PreregisteredClient, or ClientIDMetadataDocumentConfig.
+    DynamicClientRegistrationConfig: &auth.DynamicClientRegistrationConfig{
+        Metadata: &oauthex.ClientRegistrationMetadata{
+            ClientName:   "my-client",
+            RedirectURIs: []string{"http://localhost:8089/callback"},
+        },
+    },
     AuthorizationCodeFetcher: fetcher, // opens browser, returns code+state
 })
 session, err := client.Connect(ctx, &mcp.StreamableClientTransport{

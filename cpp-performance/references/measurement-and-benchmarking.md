@@ -69,10 +69,15 @@ Google Benchmark supports repetitions, warmup, multithreaded runs, aggregated re
 
 Recommended starter flags:
 ```bash
-./my_bench   --benchmark_repetitions=10   --benchmark_report_aggregates_only=true   --benchmark_min_warmup_time=0.2   --benchmark_out=benchmark.json   --benchmark_out_format=json
+./my_bench \
+  --benchmark_repetitions=10 \
+  --benchmark_display_aggregates_only=true \
+  --benchmark_min_warmup_time=0.2 \
+  --benchmark_out=benchmark.json \
+  --benchmark_out_format=json
 ```
 
-`--benchmark_min_warmup_time` requires Google Benchmark >= 1.7; older binaries abort on unknown `--benchmark_` flags.
+`--benchmark_min_warmup_time` requires Google Benchmark >= 1.7; older binaries abort on unknown `--benchmark_` flags. Use `display_aggregates_only` (not `report_aggregates_only`): it declutters the console but keeps per-repetition samples in the JSON, which `tools/compare.py` below needs; `report_aggregates_only` strips them from the file output too.
 
 For code that runs with multiple threads:
 - use `Threads(N)` or `ThreadRange(min, max)`

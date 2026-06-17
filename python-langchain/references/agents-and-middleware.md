@@ -29,10 +29,28 @@ def create_agent(
     debug: bool = False,
     name: str | None = None,
     cache: BaseCache | None = None,
+    transformers: Sequence[TransformerFactory] | None = None,
 ) -> CompiledStateGraph: ...
 ```
 
 It returns a **`CompiledStateGraph`** — a LangGraph graph implementing the model→tools loop. Use the standard runnable/graph API: `invoke`, `stream`, `ainvoke`, `astream`, plus `config=` and `context=`.
+
+| Parameter | Default | Purpose |
+|---|---|---|
+| `model` | — | `"provider:model"` string or `BaseChatModel`. |
+| `tools` | `None` | `@tool` callables, plain functions, `BaseTool`s, or provider tool dicts. |
+| `system_prompt` | `None` | System prompt (string or `SystemMessage`). No `prompt=` kwarg. |
+| `middleware` | `()` | Sequence of `AgentMiddleware`. |
+| `response_format` | `None` | Structured final output (type, `ToolStrategy`, or `ProviderStrategy`). |
+| `state_schema` | `None` | Custom mutable state TypedDict (subclass `AgentState`). |
+| `context_schema` | `None` | Immutable per-run context dataclass (read via `runtime.context`). |
+| `checkpointer` | `None` | Short-term memory (per `thread_id`). |
+| `store` | `None` | Long-term, cross-thread memory (`BaseStore`). |
+| `interrupt_before` / `interrupt_after` | `None` | Static HITL breakpoints by node name. |
+| `debug` | `False` | Verbose execution logging. |
+| `name` | `None` | Agent name (useful when nested as a subgraph). |
+| `cache` | `None` | `BaseCache` for node-level result caching. |
+| `transformers` | `None` | Message transformer factories applied to the model input. |
 
 > **v1.1.0 caveat:** one brief release (1.1.0) failed to export `create_agent` from `langchain.agents`. It is correctly exported on 1.2+. Pin to 1.2 or later.
 
@@ -242,11 +260,20 @@ agent = create_agent(
 
 cfg = {"configurable": {"thread_id": "1"}}
 result = agent.invoke({"messages": [{"role": "user", "content": "Email the team"}]}, config=cfg)
-# Agent pauses at send_email. Inspect result for the interrupt payload, then resume:
-result = agent.invoke(Command(resume={"type": "approve"}), config=cfg)
+# Agent pauses at send_email. Inspect result["__interrupt__"] for the pending action(s), then resume:
+result = agent.invoke(Command(resume={"decisions": [{"type": "approve"}]}), config=cfg)
 ```
 
-`interrupt_on` maps a tool name to `True` (require approval), `False` (auto-approve), or an `InterruptOnConfig`. Decision payloads: `{"type": "approve"}`, `{"type": "edit", "edited_action": {...}}`, `{"type": "reject", "message": "..."}`, `{"type": "respond", "message": "..."}`. You can also set static breakpoints via `interrupt_before=` / `interrupt_after=` on `create_agent`.
+`interrupt_on` maps a tool name to `True` (require approval, all decision types allowed), `False` (auto-approve), or an `InterruptOnConfig`. Resume with a `{"decisions": [...]}` payload containing **one decision per interrupted tool call**, in order. Decision shapes:
+
+| Decision | Shape |
+|---|---|
+| Approve | `{"type": "approve"}` |
+| Edit | `{"type": "edit", "edited_action": {"name": str, "args": dict}}` |
+| Reject | `{"type": "reject", "message": str}` (message optional) |
+| Respond | `{"type": "respond", "message": str}` (synthetic tool result) |
+
+`InterruptOnConfig` fields: `allowed_decisions`, `description`, `args_schema`. You can also set static breakpoints via `interrupt_before=` / `interrupt_after=` on `create_agent`.
 
 ## Deprecated Agent APIs
 

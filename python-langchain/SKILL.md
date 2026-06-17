@@ -12,6 +12,8 @@ description: Guides development with the Python LangChain v1 framework (langchai
 LangChain v1 is a framework for building LLM applications and agents. The core abstraction is `create_agent`, a tool-calling agent built on the LangGraph runtime. Requires Python 3.10+.
 
 > **Version warning — read first.** This skill targets **LangChain v1** (the `langchain` 1.x / `langchain-core` 1.x / `langgraph` 1.x line, GA October 2025). LLMs trained on v0.x emit outdated code: `LLMChain`, `AgentExecutor`, `initialize_agent`, `RetrievalQA`, `ConversationBufferMemory`, `from langchain.chat_models import ChatOpenAI`, and string-only `message.content`. **None of these are correct in v1.** When recalled APIs conflict with this document, trust this document. Legacy symbols moved to the separate `langchain-classic` package. See `references/migration-from-v0.md`.
+>
+> **Verified against** `langchain` 1.3.9, `langchain-core` 1.4.7, `langgraph` 1.2.5 (June 2026). At 1.3.9, `langchain` requires `langchain-core>=1.4.6,<2.0.0` and `langgraph>=1.2.4,<1.3.0`. v1 commits to no breaking changes before 2.0, so the APIs here are stable across the 1.x line. Re-verify when a 2.0 release appears.
 
 ## Packages and Installation
 
@@ -265,7 +267,7 @@ from langchain_core.vectorstores import InMemoryVectorStore
 from langchain_openai import OpenAIEmbeddings
 
 store = InMemoryVectorStore(OpenAIEmbeddings(model="text-embedding-3-small"))
-store.add_documents(chunks)
+store.add_documents(chunks)   # chunks: list[Document] from a text splitter (see reference)
 
 @tool
 def retrieve(query: str) -> str:

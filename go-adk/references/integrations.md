@@ -1,249 +1,147 @@
 # Integrations
 
-MCP server integration, OpenAI/custom model providers, Apigee proxying, and Vertex AI configuration for ADK Go. Verified against `google.golang.org/adk` v1.4.0.
+Model providers (Gemini, OpenAI-compatible, Apigee, custom), the model registry, MCP toolsets, outbound auth, A2A clients, Google Cloud Agent Registry, service backends, and pinned dependencies for ADK Go. Verified against `google.golang.org/adk/v2` v2.5.0.
 
-## MCP Toolset
-
-Connect ADK agents to MCP (Model Context Protocol) servers using the official Go MCP SDK (`github.com/modelcontextprotocol/go-sdk`). Do **not** use the third-party `mark3labs/mcp-go`.
+## Gemini
 
 ```go
 import (
-    "github.com/modelcontextprotocol/go-sdk/mcp"
-    "google.golang.org/adk/tool/mcptoolset"
-)
-```
-
-### Transport Types
-
-| Transport | Use Case | Import |
-|---|---|---|
-| `mcp.CommandTransport` | Local subprocess (stdio) | `os/exec` |
-| `mcp.StreamableClientTransport` | Remote HTTPS server (preferred) | - |
-| In-memory | Testing / in-process | `mcp.NewInMemoryTransports()` |
-
-### Stdio Transport (Local Process)
-
-```go
-import "os/exec"
-
-mcpTools, err := mcptoolset.New(mcptoolset.Config{
-    Transport: &mcp.CommandTransport{
-        Command: exec.Command("npx", "-y", "@modelcontextprotocol/server-filesystem", "/tmp"),
-    },
-})
-
-agent, err := llmagent.New(llmagent.Config{
-    Name:     "fs_agent",
-    Model:    model,
-    Toolsets: []tool.Toolset{mcpTools},
-})
-```
-
-### Streamable HTTP Transport (Remote Server)
-
-```go
-mcpTools, err := mcptoolset.New(mcptoolset.Config{
-    Transport: &mcp.StreamableClientTransport{
-        Endpoint: "https://my-mcp-server.example.com/mcp/",
-    },
-})
-```
-
-With authentication (e.g., GitHub Copilot MCP):
-
-```go
-import "golang.org/x/oauth2"
-
-ts := oauth2.StaticTokenSource(
-    &oauth2.Token{AccessToken: os.Getenv("GITHUB_PAT")},
-)
-mcpTools, err := mcptoolset.New(mcptoolset.Config{
-    Transport: &mcp.StreamableClientTransport{
-        Endpoint:   "https://api.githubcopilot.com/mcp/",
-        HTTPClient: oauth2.NewClient(ctx, ts),
-    },
-})
-```
-
-### In-Memory Transport (Testing)
-
-Create an MCP server and client in the same process:
-
-```go
-type WeatherInput struct {
-    City string `json:"city" jsonschema:"city name"`
-}
-type WeatherOutput struct {
-    Summary string `json:"weather_summary"`
-}
-
-func GetWeather(ctx context.Context, req *mcp.CallToolRequest, input WeatherInput) (*mcp.CallToolResult, WeatherOutput, error) {
-    return nil, WeatherOutput{Summary: "Sunny in " + input.City}, nil
-}
-
-clientTransport, serverTransport := mcp.NewInMemoryTransports()
-
-server := mcp.NewServer(&mcp.Implementation{Name: "weather", Version: "v1.0.0"}, nil)
-mcp.AddTool(server, &mcp.Tool{
-    Name:        "get_weather",
-    Description: "Gets weather for a city.",
-}, GetWeather)
-server.Connect(ctx, serverTransport, nil)
-
-mcpTools, err := mcptoolset.New(mcptoolset.Config{
-    Transport: clientTransport,
-})
-```
-
-### Tool Filtering
-
-Limit which MCP tools are exposed to the agent:
-
-```go
-// Using FilterToolset (preferred)
-filtered := tool.FilterToolset(mcpTools, tool.StringPredicate([]string{
-    "get_weather",
-    "get_forecast",
-}))
-
-agent, err := llmagent.New(llmagent.Config{
-    Toolsets: []tool.Toolset{filtered},
-    // ...
-})
-```
-
-### Human-in-the-Loop Confirmation
-
-Require user approval before MCP tool execution:
-
-```go
-mcpTools, err := mcptoolset.New(mcptoolset.Config{
-    Transport:           transport,
-    RequireConfirmation: true,  // All tools require confirmation
-})
-
-// Or dynamic confirmation per tool:
-mcpTools, err := mcptoolset.New(mcptoolset.Config{
-    Transport: transport,
-    RequireConfirmationProvider: func(toolName string, args any) bool {
-        return toolName == "delete_file"  // Only confirm destructive tools
-    },
-})
-```
-
-### Generic Toolset Confirmation (`tool.WithConfirmation`)
-
-HITL confirmation can be applied to **any** `tool.Toolset`, not just MCP toolsets. This wraps every tool in the toolset with confirmation logic.
-
-```go
-import "google.golang.org/adk/tool"
-
-// Static: all tools in the toolset require confirmation
-confirmed := tool.WithConfirmation(myToolset, true, nil)
-
-// Dynamic: per-tool confirmation decisions
-confirmed := tool.WithConfirmation(myToolset, false, func(toolName string, toolInput any) bool {
-    return toolName == "delete_record"
-})
-
-agent, err := llmagent.New(llmagent.Config{
-    Name:     "safe_agent",
-    Model:    model,
-    Toolsets: []tool.Toolset{confirmed},
-})
-```
-
-**How it works:** `WithConfirmation` returns a wrapped `Toolset` where each tool's execution checks confirmation status. When a tool requires confirmation, the agent emits a confirmation request event. The caller must approve it before the tool runs. Inside a tool function, use `ctx.ToolConfirmation()` to check status and `ctx.RequestConfirmation(hint, payload)` to trigger the approval flow.
-
-**Note:** This API is still marked **experimental** at v1.4.0 (excluded from the v1.0 API stability guarantee) and may change.
-
-### mcptoolset.Config
-
-```go
-type Config struct {
-    Client                      *mcp.Client                // Optional custom MCP client.
-    Transport                   mcp.Transport              // Required.
-    ToolFilter                  tool.Predicate             // Deprecated: use tool.FilterToolset instead.
-    RequireConfirmation         bool                       // Static HITL flag for all tools.
-    RequireConfirmationProvider tool.ConfirmationProvider  // Dynamic HITL. Takes precedence over RequireConfirmation.
-}
-
-// Defined in package tool (a package-local duplicate was removed at v1.0.0):
-type ConfirmationProvider func(toolName string, toolInput any) bool
-```
-
-**Behavior notes:**
-- MCP sessions are created lazily on first LLM request
-- Automatic reconnection on `mcp.ErrConnectionClosed`, `mcp.ErrSessionMissing`, `io.ErrClosedPipe`, `io.EOF`
-- Tool discovery happens via `ListTools()` with pagination
-- `ToolFilter` is deprecated; use `tool.FilterToolset` (shown above) for new code
-
-**Production notes:**
-- For HTTP-based MCP servers with idle timeouts, the cached `*mcp.ClientSession` may go stale between requests. Mitigate by tuning server-side timeouts or recreating the toolset on connection errors.
-- `StreamableClientTransport` supports `MaxRetries` for automatic request retries.
-
-### Complete MCP Example
-
-```go
-package main
-
-import (
-    "context"
-    "log"
-    "os"
-    "os/exec"
-
-    "github.com/modelcontextprotocol/go-sdk/mcp"
+    "google.golang.org/adk/v2/model/gemini"
     "google.golang.org/genai"
-
-    "google.golang.org/adk/agent"
-    "google.golang.org/adk/agent/llmagent"
-    "google.golang.org/adk/cmd/launcher"
-    "google.golang.org/adk/cmd/launcher/full"
-    "google.golang.org/adk/model/gemini"
-    "google.golang.org/adk/tool"
-    "google.golang.org/adk/tool/mcptoolset"
 )
 
-func main() {
-    ctx := context.Background()
+// Gemini API (AI Studio).
+m, err := gemini.NewModel(ctx, "gemini-flash-latest", &genai.ClientConfig{
+    APIKey: os.Getenv("GOOGLE_API_KEY"),
+})
 
-    model, err := gemini.NewModel(ctx, "gemini-3.1-flash-lite", &genai.ClientConfig{
-        APIKey: os.Getenv("GOOGLE_API_KEY"),
-    })
-    if err != nil { log.Fatal(err) }
+// Vertex AI. Vertex does not serve the "-latest" aliases; use a concrete model ID.
+m, err := gemini.NewModel(ctx, "gemini-3.5-flash", &genai.ClientConfig{
+    Project:  "my-gcp-project",
+    Location: "us-central1",
+    Backend:  genai.BackendVertexAI,
+})
 
-    mcpTools, err := mcptoolset.New(mcptoolset.Config{
-        Transport: &mcp.CommandTransport{
-            Command: exec.Command("npx", "-y", "@modelcontextprotocol/server-filesystem", "/tmp"),
-        },
-    })
-    if err != nil { log.Fatal(err) }
+// Environment-driven: a nil config resolves backend, key, project, and location from env vars.
+m, err := gemini.NewModel(ctx, "gemini-flash-latest", nil)
+```
 
-    a, err := llmagent.New(llmagent.Config{
-        Name:        "fs_assistant",
-        Model:       model,
-        Description: "File system assistant.",
-        Instruction: "Help the user manage files.",
-        Toolsets:    []tool.Toolset{mcpTools},
-    })
-    if err != nil { log.Fatal(err) }
+Environment variables: `GOOGLE_API_KEY` or `GEMINI_API_KEY` (Gemini API); `GOOGLE_GENAI_USE_VERTEXAI=true`, `GOOGLE_CLOUD_PROJECT`, `GOOGLE_CLOUD_LOCATION` (Vertex AI). genai v1.71.0 also adds `genai.BackendEnterprise` and `GOOGLE_GENAI_USE_ENTERPRISE`, which takes precedence over the Vertex flag.
 
-    config := &launcher.Config{AgentLoader: agent.NewSingleLoader(a)}
-    l := full.NewLauncher()
-    if err = l.Execute(ctx, config, os.Args[1:]); err != nil {
-        log.Fatalf("Run failed: %v\n\n%s", err, l.CommandLineSyntax())
-    }
+```go
+type ClientConfig struct { // google.golang.org/genai v1.71.0
+    APIKey      string
+    Backend     Backend           // BackendGeminiAPI (default), BackendVertexAI, BackendEnterprise
+    Project     string
+    Location    string
+    Credentials *auth.Credentials // cloud.google.com/go/auth
+    HTTPClient  *http.Client
+    HTTPOptions HTTPOptions       // A value, not a pointer.
 }
 ```
 
-## OpenAI Integration
+Since v2.0.0 the Gemini model no longer injects a placeholder user turn when the request has no contents.
 
-As of ADK Go v1.4.0, there is still no official `model/openai` (or Anthropic/LiteLLM-style) provider — the only built-in providers are `model/gemini` and `model/apigee`. To use OpenAI or other non-Gemini models, implement the `model.LLM` interface yourself or use a community adapter.
+## OpenAI and OpenAI-Compatible Models (`model/openaimodel`)
 
-### Writing a Custom model.LLM Provider
+Built in since v2.1.0 and marked **experimental**. Uses the Responses API by default; v2.5.0 added the Chat Completions API for providers that only implement `/v1/chat/completions`.
 
-Implement the `model.LLM` interface to use any LLM backend:
+```go
+import (
+    "github.com/openai/openai-go/v3/option"
+    "google.golang.org/adk/v2/model/openaimodel"
+)
+
+// OpenAI, Responses API (default).
+m, err := openaimodel.NewModel(ctx, "gpt-4o-mini", &openaimodel.ClientConfig{
+    APIKey: os.Getenv("OPENAI_API_KEY"),
+})
+
+// OpenAI-compatible server that only speaks Chat Completions (vLLM, Ollama, LM Studio, ...).
+local, err := openaimodel.NewModel(ctx, "llama3.1", &openaimodel.ClientConfig{
+    APIKey:  "unused-but-non-empty", // Keep non-empty so OPENAI_API_KEY is not sent to BaseURL.
+    BaseURL: "http://localhost:11434/v1",
+    API:     openaimodel.APIChatCompletions,
+})
+
+// Extra headers go through openai-go request options.
+withOrg, err := openaimodel.NewModel(ctx, "gpt-4o-mini", &openaimodel.ClientConfig{
+    APIKey:  os.Getenv("OPENAI_API_KEY"),
+    Options: []option.RequestOption{option.WithHeader("OpenAI-Organization", "org-123")},
+})
+```
+
+```go
+type ClientConfig struct {
+    APIKey     string                 // Empty: falls back to OPENAI_API_KEY.
+    BaseURL    string                 // Empty: falls back to OPENAI_BASE_URL.
+    HTTPClient *http.Client
+    Options    []option.RequestOption // openai-go escape hatch, applied last.
+    API        API                    // APIResponses (zero value) or APIChatCompletions.
+}
+func NewModel(ctx context.Context, modelName string, cfg *ClientConfig) (model.LLM, error)
+```
+
+Limitations and gotchas:
+
+- **Key leakage:** an empty `APIKey` with a custom `BaseURL` sends `OPENAI_API_KEY` to that provider. Always set a key (even a dummy one) for third-party endpoints.
+- **Function tools are non-strict**; arguments are best-effort against the declared schema. Not configurable.
+- **Structured output is always strict**: every object gets `additionalProperties: false` and **all** properties become required (optional output fields become required; map-typed fields become empty objects).
+- **Text only:** images and other inline/file data fail with `openai: unsupported content part`.
+- **Function tools only:** `geminitool.GoogleSearch{}` and other model-side tools fail with `openai: non-function tools are not supported`.
+- **Reasoning is not replayed** across turns (thought parts from earlier turns are dropped). Have the model state conclusions in its answer.
+- **Rejected config fields** (error naming the field): `TopK`, `CandidateCount > 1`, `SafetySettings`, `Labels`, `ResponseModalities`, `SpeechConfig`, `CachedContent`, and similar Gemini-only fields. `StopSequences`, penalties, and `Seed` work only with `APIChatCompletions`. `ThinkingConfig` maps to a reasoning effort.
+- A bad finish that still produced an answer is reported in `LLMResponse.CustomMetadata[openaimodel.FinishMessageKey]`.
+- `req.Model` set by a `BeforeModelCallback` overrides the constructor's model name.
+
+Azure OpenAI uses openai-go's azure options: `Options: []option.RequestOption{azure.WithEndpoint(endpoint, apiVersion), azure.WithAPIKey(key)}` (import `github.com/openai/openai-go/v3/azure`). Azure key auth uses the `Api-Key` header, so a plain `BaseURL` + `APIKey` does not work.
+
+## Apigee Proxy (`model/apigee`)
+
+Routes Gemini traffic through an Apigee API proxy. **The model name must start with `apigee/`**, otherwise `NewModel` fails with `invalid model string`.
+
+```go
+import "google.golang.org/adk/v2/model/apigee"
+
+m, err := apigee.NewModel(ctx, "apigee/gemini-2.5-flash",
+    apigee.WithProxyURL("https://my-apigee-host/v1/gemini"), // Or env APIGEE_PROXY_URL.
+    apigee.WithCustomHeaders(http.Header{"x-api-key": []string{os.Getenv("APIGEE_KEY")}}),
+)
+```
+
+Accepted name forms: `apigee/<model>`, `apigee/gemini/<model>`, `apigee/vertex_ai/<model>`, and versioned variants such as `apigee/vertex_ai/v1/<model>`. The `apigee/vertex_ai/` prefix (or `GOOGLE_GENAI_USE_VERTEXAI=true`) selects Vertex AI and requires `GOOGLE_CLOUD_PROJECT` and `GOOGLE_CLOUD_LOCATION`. `WithHTTPClient` is documented as testing-only.
+
+## Model Registry (`model.Register` / `model.NewLLM`)
+
+A name-based registry (v2.1.0) for choosing a provider from configuration. **Registration is opt-in**: no provider package registers itself on import.
+
+```go
+import (
+    "google.golang.org/adk/v2/model"
+    "google.golang.org/adk/v2/model/gemini"
+    "google.golang.org/adk/v2/model/openaimodel"
+)
+
+func init() {
+    model.Register(`^(?i)gemini-`, func(ctx context.Context, name string) (model.LLM, error) {
+        return gemini.NewModel(ctx, name, nil)
+    })
+    model.Register(`^(gpt-|o[0-9])`, func(ctx context.Context, name string) (model.LLM, error) {
+        return openaimodel.NewModel(ctx, name, &openaimodel.ClientConfig{APIKey: os.Getenv("OPENAI_API_KEY")})
+    })
+}
+
+// Later:
+llm, err := model.NewLLM(ctx, os.Getenv("MODEL")) // e.g. "gemini-flash-latest" or "gpt-4o-mini"
+```
+
+- Patterns are Go regexps matched **unanchored**; anchor them with `^`/`$`.
+- `NewLLM` requires **exactly one** matching pattern (zero or several matches are errors).
+- `Register` panics on an invalid regexp or a duplicate pattern.
+
+## Custom `model.LLM` Providers
+
+For providers without a built-in package (Anthropic, Bedrock, etc.), implement the interface:
 
 ```go
 package myprovider
@@ -252,173 +150,382 @@ import (
     "context"
     "iter"
 
-    "google.golang.org/adk/model"
+    "google.golang.org/adk/v2/model"
     "google.golang.org/genai"
 )
 
 type MyModel struct {
     name string
-    // ... your client
 }
 
-func NewModel(name string /* , config ... */) (model.LLM, error) {
+func NewModel(name string) (model.LLM, error) {
     return &MyModel{name: name}, nil
 }
 
 func (m *MyModel) Name() string { return m.name }
 
-func (m *MyModel) GenerateContent(
-    ctx context.Context,
-    req *model.LLMRequest,
-    stream bool,
-) iter.Seq2[*model.LLMResponse, error] {
+func (m *MyModel) GenerateContent(ctx context.Context, req *model.LLMRequest, stream bool) iter.Seq2[*model.LLMResponse, error] {
     return func(yield func(*model.LLMResponse, error) bool) {
-        // 1. Convert req.Contents ([]*genai.Content) to your provider's format
-        // 2. Convert req.Config (*genai.GenerateContentConfig) for temperature, etc.
-        // 3. Convert req.Tools to your provider's tool/function format
-        // 4. Call your LLM API
-        // 5. Convert response back to model.LLMResponse
-
-        // For non-streaming, yield a single response:
+        // 1. Convert req.Contents ([]*genai.Content) to the provider's message format.
+        // 2. Map req.Config (temperature, max tokens, response schema, ...).
+        // 3. Convert function declarations in req.Config.Tools to the provider's tool format.
+        // 4. Call the provider and convert the response back.
         yield(&model.LLMResponse{
             Content: &genai.Content{
+                Role:  genai.RoleModel,
                 Parts: []*genai.Part{genai.NewPartFromText("Hello!")},
-                Role:  "model",
             },
             TurnComplete: true,
         }, nil)
-
-        // For streaming, yield multiple partial responses:
-        // yield(&model.LLMResponse{Content: chunk1, Partial: true}, nil)
-        // yield(&model.LLMResponse{Content: chunk2, Partial: true}, nil)
-        // yield(&model.LLMResponse{Content: final, TurnComplete: true}, nil)
+        // Streaming: yield chunks with Partial: true, then a final response with TurnComplete: true.
     }
 }
 ```
 
-**Key conversion requirements:**
-
-| ADK Type | You Must Handle |
+| ADK type | Provider mapping |
 |---|---|
-| `req.Contents` | Convert `[]*genai.Content` (with `Parts` containing text, function calls, function responses) to your format |
-| `req.Config` | Map `Temperature`, `MaxOutputTokens`, `ResponseMIMEType`, etc. |
-| `req.Tools` | Convert `genai.FunctionDeclaration` tool schemas to your provider's format |
-| Response `Content` | Convert your provider's response to `*genai.Content` with appropriate `Parts` |
-| Function calls | Map your provider's tool calls to `genai.FunctionCall` parts |
-| Streaming | Set `Partial: true` for intermediate chunks, `TurnComplete: true` for final |
+| `req.Contents` | `[]*genai.Content` with text, `FunctionCall`, and `FunctionResponse` parts |
+| `req.Config` | `Temperature`, `MaxOutputTokens`, `ResponseMIMEType`, `ResponseSchema`, `SystemInstruction`, `Tools` |
+| Response content | `*genai.Content` (role `model`) with text and `genai.FunctionCall` parts |
+| Usage | `UsageMetadata` (`*genai.GenerateContentResponseUsageMetadata`) feeds telemetry and compaction |
+| Streaming | `Partial: true` for chunks, `TurnComplete: true` for the final response |
 
-**Usage with ADK:**
+`model.LLMRequest` and `model.LLMResponse` have the same fields as in v1 (camelCase JSON tags since v2.2.0).
 
-```go
-myModel, err := myprovider.NewModel("gpt-4o")
-agent, err := llmagent.New(llmagent.Config{
-    Name:  "my_agent",
-    Model: myModel,
-    // ... rest of config
-})
-```
+## MCP Toolset (`tool/mcptoolset`)
 
-### OpenAI Go SDK Reference
-
-The official SDK is at `github.com/openai/openai-go`. Key usage:
+Connects agents to MCP servers using the official Go MCP SDK (`github.com/modelcontextprotocol/go-sdk`, v1.8.0 at ADK v2.5.0). Do **not** use the third-party `mark3labs/mcp-go`.
 
 ```go
 import (
-    "github.com/openai/openai-go/v3"
-    "github.com/openai/openai-go/v3/option"
+    "github.com/modelcontextprotocol/go-sdk/mcp"
+    "google.golang.org/adk/v2/auth"
+    "google.golang.org/adk/v2/tool/mcptoolset"
 )
 
-client := openai.NewClient(option.WithAPIKey(os.Getenv("OPENAI_API_KEY")))
+// Local subprocess (stdio).
+fsTools, err := mcptoolset.New(mcptoolset.Config{
+    Transport: &mcp.CommandTransport{
+        Command: exec.Command("npx", "-y", "@modelcontextprotocol/server-filesystem", "/tmp"),
+    },
+})
 
-// For Azure OpenAI:
-client := openai.NewClient(
-    option.WithBaseURL("https://my-resource.openai.azure.com/openai"),
-    option.WithAPIKey(os.Getenv("AZURE_OPENAI_KEY")),
-)
-```
+// Remote streamable HTTP server with a static bearer token. Credentialed
+// clients must refuse redirects (see refuseRedirects below).
+ghTools, err := mcptoolset.New(mcptoolset.Config{
+    Transport: &mcp.StreamableClientTransport{
+        Endpoint:   "https://api.githubcopilot.com/mcp/",
+        HTTPClient: &http.Client{CheckRedirect: refuseRedirects}, // Kept when Auth wraps the client.
+    },
+    Auth: auth.StaticToken(os.Getenv("GITHUB_PAT")),
+})
 
-## Gemini / Vertex AI Configuration
+// Header API key, or Google Application Default Credentials.
+keyed, err := mcptoolset.New(mcptoolset.Config{
+    Transport: &mcp.StreamableClientTransport{
+        Endpoint:   "https://mcp.example.com/mcp",
+        HTTPClient: &http.Client{CheckRedirect: refuseRedirects},
+    },
+    Auth: auth.APIKey("X-Api-Key", os.Getenv("EXAMPLE_KEY")),
+})
+gcpTools, err := mcptoolset.New(mcptoolset.Config{
+    Transport: &mcp.StreamableClientTransport{
+        Endpoint:   "https://my-mcp.example.googleapis.com/mcp",
+        HTTPClient: &http.Client{CheckRedirect: refuseRedirects},
+    },
+    Auth: auth.ADC(), // cloud-platform scope by default.
+})
 
-Model IDs below match the official v1.4.0 quickstart; any current Gemini model ID works.
+// Unauthenticated servers can use the Endpoint shorthand (a default client).
+publicTools, err := mcptoolset.New(mcptoolset.Config{Endpoint: "https://mcp.example.com/public/mcp"})
 
-### Gemini API (Default)
-
-```go
-model, err := gemini.NewModel(ctx, "gemini-3.1-flash-lite", &genai.ClientConfig{
-    APIKey: os.Getenv("GOOGLE_API_KEY"),
+agent, err := llmagent.New(llmagent.Config{
+    Name:     "fs_agent",
+    Model:    m,
+    Toolsets: []tool.Toolset{fsTools},
 })
 ```
 
-Environment variables: `GOOGLE_API_KEY` or `GEMINI_API_KEY`.
-
-### Vertex AI
+**Never let a credentialed client follow redirects.** `auth.Transport` resolves and applies the credential on every request, including a redirect hop after `net/http` has stripped `Authorization`, so a redirecting endpoint would receive the token. `Config.Endpoint` builds a default `http.Client` that follows redirects; with `Auth`, pass a `StreamableClientTransport` whose `HTTPClient` refuses them:
 
 ```go
-model, err := gemini.NewModel(ctx, "gemini-3.1-flash-lite", &genai.ClientConfig{
-    Project:  "my-gcp-project",
-    Location: "us-central1",
-    Backend:  genai.BackendVertexAI,
-})
+// refuseRedirects returns redirect responses to the caller instead of following them.
+func refuseRedirects(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 ```
 
-Environment variables:
-- `GOOGLE_GENAI_USE_VERTEXAI=true`
-- `GOOGLE_CLOUD_PROJECT=my-gcp-project`
-- `GOOGLE_CLOUD_LOCATION=us-central1`
-
-### Auto-Detection
-
-With no explicit config, ADK checks environment variables:
+In-memory transports (`mcp.NewInMemoryTransports()`) work for tests: connect an `mcp.NewServer` to the server end and pass the client end as `Transport`. The older `HTTPClient: oauth2.NewClient(ctx, ts)` pattern on `mcp.StreamableClientTransport` still works.
 
 ```go
-model, err := gemini.NewModel(ctx, "gemini-3.1-flash-lite", &genai.ClientConfig{})
-```
-
-### genai.ClientConfig
-
-```go
-type ClientConfig struct {
-    APIKey      string          // For Gemini API.
-    Project     string          // GCP project for Vertex AI.
-    Location    string          // GCP region for Vertex AI.
-    Backend     Backend         // BackendGeminiAPI (default) or BackendVertexAI.
-    HTTPOptions *HTTPOptions    // Custom HTTP headers.
+type Config struct {
+    Client                      *mcp.Client                // Optional custom MCP client.
+    Transport                   mcp.Transport              // Stdio, streamable HTTP, in-memory, ...
+    Endpoint                    string                     // v2.1.0+: used when Transport is nil.
+    Auth                        auth.CredentialProvider    // v2.1.0+: per-request credentials; needs a streamable HTTP transport.
+    ToolFilter                  tool.Predicate             // Deprecated: use tool.FilterToolset.
+    RequireConfirmation         bool                       // HITL for every tool.
+    RequireConfirmationProvider tool.ConfirmationProvider  // Dynamic HITL; takes precedence.
 }
 ```
 
-### Apigee Proxy (`model/apigee`)
+Behavior notes:
 
-Route Gemini traffic through an Apigee API proxy (enterprise gateway policies, key management):
+- At v2.5.0, a config with neither `Transport` nor `Endpoint` is **not** rejected by `New`; it fails later during tool discovery with a nil-pointer panic (under the runner, a run error such as `node "root" panicked: ...`). Validate your config.
+- `Auth` with a non-HTTP transport fails at construction. Do not combine `Auth` with the transport's own `OAuthHandler`.
+- Sessions are created lazily on the first LLM request and reconnect automatically on closed connections or missing sessions. Tool discovery paginates `ListTools`.
+- **Tool calls are at-least-once.** When `CallTool` fails with a closed connection, missing session, or EOF, ADK reconnects and **resends the same call once**. If the server had already executed it before the connection dropped, a mutating tool (create record, send message, charge payment) runs twice while ADK reports one result (upstream issue #1689). Make mutating MCP tools idempotent (e.g. accept an idempotency key) or avoid exposing non-idempotent operations. Confirmation does not help: it completes before `CallTool`, so the confirmed call is the one that gets resent.
+- Results: `StructuredContent` is returned as `{"output": ...}`; otherwise text is returned as `{"output": "<text>"}`. Since v2.4.0, empty text is valid, and non-text content (images, audio, resource links) is rendered as bracketed labels instead of being dropped (binary payloads are not forwarded to the model).
+- `IsError: true` results become a tool error: `Tool execution failed. Details: ...`.
+- For HTTP servers with idle timeouts, the cached session can go stale; tune server timeouts or recreate the toolset on persistent connection errors.
+
+### Filtering and Confirmation
 
 ```go
-import "google.golang.org/adk/model/apigee"
+filtered := tool.FilterToolset(fsTools, tool.AllowedToolsPredicate([]string{"read_file", "list_directory"}))
 
-model, err := apigee.NewModel(ctx, "gemini-3.1-flash-lite",
-    apigee.WithProxyURL("https://my-apigee-host/v1/gemini"),
-    apigee.WithCustomHeaders(http.Header{"x-api-key": []string{os.Getenv("APIGEE_KEY")}}),
-    // apigee.WithHTTPClient(customClient),
-)
+confirmed, err := mcptoolset.New(mcptoolset.Config{
+    Transport: transport,
+    RequireConfirmationProvider: func(toolName string, args any) bool {
+        return toolName == "delete_file" // Only confirm destructive tools.
+    },
+})
+
+// Any toolset (experimental API): wrap with confirmation logic.
+safe := tool.WithConfirmation(myToolset, false, func(toolName string, toolInput any) bool {
+    return toolName == "delete_record"
+})
 ```
+
+`tool.StringPredicate` is deprecated in favor of `tool.AllowedToolsPredicate`. `tool.WithConfirmation` is still experimental; since v2.5.0 it also wraps streaming tools. When a tool needs confirmation, the agent emits a function call named `toolconfirmation.FunctionCallName` (`"adk_request_confirmation"`); `toolconfirmation.OriginalCallFrom(fc)` extracts the call awaiting approval. The caller replies in the next `Run` with a user-role `FunctionResponse` that has the **same ID** and name, and `Response: map[string]any{"confirmed": true, "payload": optionalPayload}`. Inside a tool, `ctx.ToolConfirmation()` reads the decision and `ctx.RequestConfirmation(hint, payload)` triggers the flow.
+
+## Outbound Auth (`auth`, `auth/gcp`)
+
+Credentials for outbound calls (MCP servers, A2A peers, any HTTP client). Core package since v2.1.0; `auth/gcp` REST client since v2.3.0; credential caching (`CredentialStore`) and the per-user `gcp.NewProvider` since v2.5.0.
+
+```go
+type Credential interface{ Apply(h http.Header) error }
+type CredentialProvider interface{ Credential(ctx context.Context) (Credential, error) }
+
+func StaticToken(token string) CredentialProvider             // Authorization: Bearer <token>
+func APIKey(name, value string) CredentialProvider            // <name>: <value>
+func TokenSourceProvider(ts oauth2.TokenSource) CredentialProvider
+func ADC(scopes ...string) CredentialProvider                  // Default scope: cloud-platform.
+func ServiceAccount(cfg ServiceAccountConfig) CredentialProvider // JSONKey + Scopes, or Audience for ID tokens.
+
+type Transport struct {              // Applies a provider's credential per request.
+    Provider CredentialProvider
+    Base     http.RoundTripper       // nil = http.DefaultTransport
+}
+
+type ConsentRequiredError struct{ AuthURI, Nonce, Key string }
+func NewInMemoryCredentialStore() *InMemoryCredentialStore
+```
+
+Wrap any HTTP client, and always refuse redirects on clients that carry credentials (`auth.Transport` re-applies the credential on every hop, including to another host):
+
+```go
+authed := &http.Client{
+    Transport:     &auth.Transport{Provider: auth.ADC()},
+    CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+}
+```
+
+**Per-user credentials (`auth/gcp`):** resolves end-user credentials from Google Cloud Agent Identity or IAM Connector credential services, keyed by the acting user from `agent.IdentityFromContext(ctx)`.
+
+```go
+import "google.golang.org/adk/v2/auth/gcp"
+
+client, err := gcp.NewClient(ctx, nil) // Build ONE long-lived client; per-request clients defeat the cache.
+if err != nil {
+    return err
+}
+perUser, err := gcp.NewProvider(ctx, gcp.ProviderConfig{
+    Scheme: gcp.ProviderScheme{
+        Name:   "projects/my-proj/locations/global/connectors/github",
+        Scopes: []string{"repo"},
+    },
+    Client: client,
+    Store:  auth.NewInMemoryCredentialStore(),
+})
+if err != nil {
+    return err
+}
+
+// One MCP toolset per end user: an MCP session stays bound to the user who opened it.
+userTools := &perUserToolset{
+    sets: map[string]tool.Toolset{},
+    newFor: func(userID string) (tool.Toolset, error) {
+        return mcptoolset.New(mcptoolset.Config{
+            Transport: &mcp.StreamableClientTransport{
+                Endpoint:   "https://mcp.example.com/mcp",
+                HTTPClient: &http.Client{CheckRedirect: refuseRedirects}, // Required by gcp.NewProvider.
+            },
+            Auth: perUser, // Resolves the credential from the request context's ADK identity.
+        })
+    },
+}
+// llmagent.Config{Toolsets: []tool.Toolset{userTools}, ...}
+```
+
+```go
+// perUserToolset lazily builds one toolset per ADK user ID (implements tool.Toolset).
+type perUserToolset struct {
+    mu     sync.Mutex
+    sets   map[string]tool.Toolset
+    newFor func(userID string) (tool.Toolset, error)
+}
+
+func (p *perUserToolset) Name() string { return "per_user_mcp" }
+
+func (p *perUserToolset) Tools(ctx agent.ReadonlyContext) ([]tool.Tool, error) {
+    p.mu.Lock()
+    ts, ok := p.sets[ctx.UserID()]
+    if !ok {
+        var err error
+        if ts, err = p.newFor(ctx.UserID()); err != nil { // mcptoolset.New does not dial.
+            p.mu.Unlock()
+            return nil, err
+        }
+        p.sets[ctx.UserID()] = ts
+    }
+    p.mu.Unlock()
+    return ts.Tools(ctx) // The MCP session opens lazily under this user's context.
+}
+```
+
+- The provider fails with `gcp.ErrNoActingUser` when the context carries no ADK identity. ADK does **not** authenticate `session.UserID`; trust comes from your server's authentication.
+- Interactive consent is not wired into the tool layer at v2.5.0: a `*auth.ConsentRequiredError` surfaces as an ordinary tool error.
+- **Never share one credentialed `mcptoolset` across users.** Its MCP session (and the server-side state behind `Mcp-Session-Id`) is opened by whichever user connects first. Later users' calls carry their own token but run inside that first user's session, so servers that bind identity at `initialize` treat them as the first user. One toolset per user, as above, gives each user their own session (verified with two users against a streamable MCP server). The cache grows with the user count; evict idle entries in long-running servers.
+
+## A2A Remote Agents (`agent/remoteagent/v2`)
+
+```go
+import remoteagent "google.golang.org/adk/v2/agent/remoteagent/v2"
+
+remote, err := remoteagent.NewA2A(remoteagent.A2AConfig{
+    Name:              "prime_agent",
+    Description:       "Checks if numbers are prime.",
+    AgentCardProvider: remoteagent.NewAgentCardProvider("https://prime.example.com"), // URL or file path.
+})
+```
+
+- **Card origin pinning (v2.4.0+):** every interface URL in a fetched card must use `https` (or `http` on a loopback host) and share the origin (scheme, host, port) of the configured source URL; otherwise `ErrUntrustedCardInterface`. Static `AgentCard` values and file sources are not checked.
+- `NewAgentCardProvider` accepts only `http(s)://` URLs or plain paths; other schemes return `ErrUnsupportedCardSource`.
+- `AllowTransferToAgent` (default `false`) redacts a peer's `transfer_to_agent` request. Enable it only for trusted peers.
+- `BeforeRequestCallbacks` / `AfterRequestCallbacks` take `agent.Context`. When the remote agent runs inside a graph node with an isolation scope, history is filtered to that scope.
+- The v1 package `agent/remoteagent` (a2a-go v0) is deprecated; use `/v2`.
+
+**Per-request auth at v2.5.0:** there is no `Auth` field on `A2AConfig` yet. Supply an authenticated client factory:
+
+```go
+import "github.com/a2aproject/a2a-go/v2/a2aclient"
+
+hc := &http.Client{
+    Transport:     &auth.Transport{Provider: auth.StaticToken(os.Getenv("REMOTE_TOKEN"))},
+    CheckRedirect: refuseRedirects, // Never forward the token to a redirect target.
+}
+factory := a2aclient.NewFactory(a2aclient.WithJSONRPCTransport(hc), a2aclient.WithRESTTransport(hc))
+remote, err := remoteagent.NewA2A(remoteagent.A2AConfig{
+    Name:              "prime_agent",
+    Description:       "Checks if numbers are prime.",
+    AgentCardProvider: remoteagent.NewAgentCardProvider("https://prime.example.com"),
+    ClientProvider:    remoteagent.NewA2AClientProvider(factory),
+})
+```
+
+## Google Cloud Agent Registry (`agentregistry`)
+
+A client for discovering A2A agents, MCP servers, and endpoints registered in Agent Registry (v2.1.0+), with factories that turn entries into ADK agents and toolsets. Needs `roles/agentregistry.viewer`.
+
+```go
+import "google.golang.org/adk/v2/agentregistry"
+
+reg, err := agentregistry.New(ctx, agentregistry.Config{
+    ProjectID: os.Getenv("GOOGLE_CLOUD_PROJECT"),
+    Location:  "global",
+}) // nil HTTPClient = ADC with mTLS endpoint selection.
+
+for srv, err := range reg.AllMCPServers(ctx, agentregistry.WithPageSize(50)) {
+    if err != nil {
+        return err
+    }
+    if slices.ContainsFunc(srv.Tools, func(t agentregistry.Tool) bool { return t.Name == "list_log_names" }) {
+        tools, err := reg.MCPToolset(ctx, srv.Name)
+        // ...
+    }
+}
+
+remote, err := reg.RemoteAgent(ctx, "projects/p/locations/global/agents/my-agent",
+    agentregistry.WithA2AHTTPClient(&http.Client{
+        Transport:     &auth.Transport{Provider: auth.ADC()},
+        CheckRedirect: refuseRedirects,
+    }))
+```
+
+- Discovery: `ListAgents`/`GetAgent`/`AllAgents`, `ListMCPServers`/`GetMCPServer`/`AllMCPServers`, `ListEndpoints`/`GetEndpoint`/`AllEndpoints`; options `WithFilter`, `WithPageSize`, `WithPageToken`. Non-2xx responses are `*agentregistry.APIError`.
+- The registry is a catalog, not a proxy. `MCPToolset` reuses the registry's ADC client only for `*.googleapis.com` endpoints; `RemoteAgent` never authenticates unless you pass `WithA2AHTTPClient` or `WithA2AHeaders`.
 
 ## Service Backends
 
-| Service | In-memory | Production backends |
+| Service | In-memory | Production |
 |---|---|---|
-| Sessions | `session.InMemoryService()` | `session/database` (GORM dialectors: Postgres, SQLite, ...; run `database.AutoMigrate`), `session/vertexai` (Agent Engine sessions) |
-| Memory | `memory.InMemoryService()` | `memory/vertexai` (Vertex AI Memory Bank, v1.3.0+) |
-| Artifacts | `artifact.InMemoryService()` | `artifact/gcsartifact` (Google Cloud Storage) |
+| Sessions | `session.InMemoryService()` | `session/database.NewSessionService(dialector, opts...)` or `NewSessionServiceFromDB(*gorm.DB)` (v2.4.0+); `session/vertexai.NewSessionService(ctx, VertexAIServiceConfig{ProjectID, Location, ReasoningEngine})` |
+| Memory | `memory.InMemoryService()` | `memory/vertexai.NewService(ctx, &ServiceConfig{...})` (Vertex AI Memory Bank) |
+| Artifacts | `artifact.InMemoryService()` | `artifact/gcsartifact.NewService(ctx, bucketName, opts...)` |
 
-See `api-reference.md` for constructor signatures.
+```go
+import (
+    "github.com/glebarez/sqlite"
+    "gorm.io/gorm"
+    "google.golang.org/adk/v2/session/database"
+)
+
+db, err := gorm.Open(sqlite.Open("sessions.db"), &gorm.Config{})
+if err != nil {
+    log.Fatal(err)
+}
+sessions, err := database.NewSessionServiceFromDB(db)
+if err != nil {
+    log.Fatal(err)
+}
+if err := database.AutoMigrate(sessions); err != nil { // Run on EVERY startup.
+    log.Fatal(err)
+}
+```
+
+- **`database.AutoMigrate` must run on every startup.** The service never creates or alters tables; v2.0.0 added workflow columns and v2.5.0 added transcription columns, and `AppendEvent` fails until they exist.
+- `Get` and `AppendEvent` of every bundled session service wrap `session.ErrNotFound` (v2.4.0); match with `errors.Is`. Custom services must wrap it too (the REST server maps it to 404).
+- Custom session services must persist the **complete** event: every `session.Event` field, including the embedded `LLMResponse` fields (such as live-run `InputTranscription`/`OutputTranscription`), `LongRunningToolIDs`, `Actions` (with `Compaction`), and the v2 fields (`IsolationScope`, `Routes`, `RequestedInput`, `Output`, `NodeInfo`). Storing the JSON-encoded event is the simplest way to keep up as fields are added. `session/sessiontestsuite` checks the contract.
+- `artifact.ArtifactVersion.CreateTime` is `time.Time` (was `float64` in v1). `CanonicalURI` is a stable identity (`gs://bucket/object` for GCS since v2.4.0), not a download URL. `gcsartifact.Save` can return `gcsartifact.ErrVersionConflict` under concurrent writers; retry it.
+
+### BigQuery Agent Analytics Plugin
+
+A separate Go module, `google.golang.org/adk/plugin/agentanalytics` (no `/v2`, no release tags; `go get` resolves a pseudo-version). It logs every lifecycle event to BigQuery through the Storage Write API.
+
+```go
+import (
+    "google.golang.org/adk/plugin/agentanalytics"
+    "google.golang.org/adk/v2/plugin"
+)
+
+cfg := agentanalytics.DefaultConfig() // Dataset "agent_analytics", table "events", batched writes.
+cfg.ProjectID = "my-project"
+p, err := agentanalytics.NewBigQueryAgentAnalyticsPluginWithConfig(ctx, cfg)
+// runner.Config{PluginConfig: runner.PluginConfig{Plugins: []*plugin.Plugin{p}}}
+```
+
+A table the plugin creates is day-partitioned on `timestamp` (v2.5.0); existing tables are not altered.
 
 ## Key Dependencies
 
-Versions as pinned by ADK Go v1.4.0:
+Versions pinned by ADK Go v2.5.0 (`go 1.26.6`):
 
 ```
-google.golang.org/adk                              # ADK core (v1.4.0)
-google.golang.org/genai                             # Google GenAI types (v1.57.0)
-github.com/modelcontextprotocol/go-sdk              # Official MCP SDK (v1.4.1; NOT mark3labs/mcp-go)
-github.com/a2aproject/a2a-go/v2                     # A2A protocol v2 (used by remoteagent/v2)
-github.com/a2aproject/a2a-go                        # A2A protocol v1 (deprecated remoteagent v1)
-github.com/openai/openai-go/v3                      # OpenAI SDK (for custom providers)
+google.golang.org/adk/v2                      v2.5.0
+google.golang.org/genai                       v1.71.0
+github.com/modelcontextprotocol/go-sdk        v1.8.0   (NOT mark3labs/mcp-go)
+github.com/a2aproject/a2a-go/v2               v2.5.0   (remoteagent/v2, server/adka2a/v2)
+github.com/a2aproject/a2a-go                  v0.3.15  (deprecated v1 A2A packages only)
+github.com/openai/openai-go/v3                v3.64.0  (model/openaimodel)
+github.com/google/jsonschema-go               v0.4.3   (functiontool and workflow schemas)
+go.opentelemetry.io/otel                      v1.46.0  (otel/log v0.22.0)
 ```

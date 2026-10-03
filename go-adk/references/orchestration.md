@@ -131,7 +131,7 @@ Otherwise, provide specific criticism for improvement.`,
 })
 
 refinementLoop, _ := loopagent.New(loopagent.Config{
-    MaxIterations: 5, // 0 = run until a sub-agent escalates.
+    MaxIterations: 5, // Always bound it; 0 is unbounded (see below).
     AgentConfig: agent.Config{
         Name:      "RefinementLoop",
         SubAgents: []agent.Agent{generator, critic},
@@ -143,6 +143,9 @@ refinementLoop, _ := loopagent.New(loopagent.Config{
 1. `MaxIterations` is reached.
 2. A sub-agent calls `exit_loop` (sets `Escalate = true` and `SkipSummarization = true`).
 3. A tool sets `ctx.Actions().Escalate = true` programmatically.
+4. The consumer stops iterating the `Run` stream.
+
+**Errors do not stop a loop.** At v2.5.0 `loopagent` yields a sub-agent's error and starts the next iteration. With `MaxIterations: 0` and a persistent failure (bad model name, quota, auth), it calls the model indefinitely for as long as the consumer keeps reading, and the console and SSE launchers keep reading (upstream issue #1683). Always set a finite `MaxIterations`, and stop iterating `Run` on the first error in your own consumers.
 
 **Custom exit tool:**
 

@@ -260,10 +260,10 @@ type Context interface {
 
 | Where | Returns nil / no-op | Works |
 |---|---|---|
-| Agent and model callbacks | `Agent()`, `Session()`, `Memory()`, `RunConfig()`, `Actions()`, `FunctionCallID()`, `EndInvocation()`, `SearchMemory`, `RequestConfirmation` | `State()`, `ReadonlyState()`, `Artifacts()`, identity accessors (`AgentName()`, `UserID()`, `SessionID()`, ...) |
-| Tools and tool callbacks | `Agent()`, `Session()`, `Memory()`, `RunConfig()`, `EndInvocation()`, `ResumedInput()` | `State()`, `Actions()`, `Artifacts()`, `SearchMemory`, `FunctionCallID`, `ToolConfirmation`, `RequestConfirmation`, identity accessors |
+| Agent and model callbacks | `Agent()`, `Session()`, `Memory()`, `RunConfig()`, `Actions()`, `FunctionCallID()`, `EndInvocation()`, `SearchMemory`, `RequestConfirmation`, `WithContext()`, `WithAgentContext()`, `WithAgentTimeout()` and `WithAgentCancel()` (both return `nil, nil`) | `State()`, `ReadonlyState()`, `Artifacts()`, identity accessors (`AgentName()`, `UserID()`, `SessionID()`, ...) |
+| Tools and tool callbacks | `Agent()`, `Session()`, `Memory()`, `RunConfig()`, `EndInvocation()`, `ResumedInput()`, `WithContext()`, `WithAgentContext()`, `WithAgentTimeout()` (returns `nil, nil`) | `State()`, `Actions()`, `Artifacts()`, `SearchMemory`, `FunctionCallID`, `ToolConfirmation`, `RequestConfirmation`, `WithAgentCancel()`, identity accessors |
 
-Use `ctx.AgentName()` (not `ctx.Agent().Name()`), `ctx.State()` (not `ctx.Session().State()`), and `ctx.SearchMemory(...)` (not `ctx.Memory()`). `ctx.Artifacts()` is nil when the runner has no `ArtifactService`.
+Use `ctx.AgentName()` (not `ctx.Agent().Name()`), `ctx.State()` (not `ctx.Session().State()`), and `ctx.SearchMemory(...)` (not `ctx.Memory()`). `ctx.Artifacts()` is nil when the runner has no `ArtifactService`. For a deadline inside a tool or callback, derive a plain context instead of calling the nil-returning helpers: `tctx, cancel := context.WithTimeout(ctx, 10*time.Second); defer cancel()` (calling `cancel` from `WithAgentTimeout` there panics).
 
 ```go
 // Constructors for tests and embedding.
@@ -391,7 +391,7 @@ func InMemoryService() Service
 
 type CreateRequest struct {
     AppName, UserID, SessionID string
-    State                      map[string]any
+    State                      map[string]any // Persistent keys only; pass temp: keys via runner.WithStateDelta.
 }
 type GetRequest struct {
     AppName, UserID, SessionID string
@@ -598,7 +598,7 @@ type Config struct {
 // loopagent
 type Config struct {
     AgentConfig   agent.Config
-    MaxIterations uint // 0 = run until a sub-agent escalates.
+    MaxIterations uint // 0 = unbounded: runs until a sub-agent escalates, even across errors. Prefer a finite bound.
 }
 
 // agent/workflowagent (graph workflows)

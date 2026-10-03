@@ -167,8 +167,12 @@ localTools, err := mcptoolset.New(mcptoolset.Config{
     Transport: &mcp.CommandTransport{Command: exec.Command("myserver")}, // stdio
 })
 remoteTools, err := mcptoolset.New(mcptoolset.Config{
-    Endpoint: "https://api.githubcopilot.com/mcp/", // Streamable HTTP shorthand (v2.1.0+)
-    Auth:     auth.StaticToken(os.Getenv("GITHUB_PAT")),
+    Transport: &mcp.StreamableClientTransport{
+        Endpoint: "https://api.githubcopilot.com/mcp/",
+        // Credentialed clients must refuse redirects: auth.Transport re-applies the token on every hop.
+        HTTPClient: &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }},
+    },
+    Auth: auth.StaticToken(os.Getenv("GITHUB_PAT")), // Per-request credentials (v2.1.0+)
 })
 
 a, err := llmagent.New(llmagent.Config{
@@ -178,7 +182,7 @@ a, err := llmagent.New(llmagent.Config{
 })
 ```
 
-Always set `Transport` or `Endpoint`: at v2.5.0 an empty config is accepted and fails later at tool discovery with a nil-pointer panic. Filter with `tool.FilterToolset(ts, tool.AllowedToolsPredicate(names))`. For HITL confirmation, per-user GCP credentials, and result handling, read `references/integrations.md`.
+Always set `Transport` or `Endpoint` (shorthand for an unauthenticated streamable transport): at v2.5.0 an empty config is accepted and fails later at tool discovery with a nil-pointer panic. Tool calls are at-least-once: after a dropped connection ADK reconnects and resends the call, so make mutating MCP tools idempotent. Filter with `tool.FilterToolset(ts, tool.AllowedToolsPredicate(names))`. For HITL confirmation, per-user GCP credentials, and result handling, read `references/integrations.md`.
 
 ### AgentTool
 
@@ -273,7 +277,7 @@ For all agent-based patterns with complete code (parallel gather, critic/refiner
 | `temp:` | Current invocation only | Stripped from stored events |
 | *(none)* | Current session | Session lifetime |
 
-Prefixes do not compose: `app:temp:x` is an app-scoped key that persists. `OutputKey` stores an agent's final text in state, and `{key}` placeholders in `Instruction` read it back. Seed state with `session.CreateRequest.State` (below) or `runner.WithStateDelta`.
+Prefixes do not compose: `app:temp:x` is an app-scoped key that persists. `OutputKey` stores an agent's final text in state, and `{key}` placeholders in `Instruction` read it back. Seed persistent state with `session.CreateRequest.State` (below) and invocation-only `temp:` values with `runner.WithStateDelta`: a `temp:` key seeded at creation persists in the in-memory service but is dropped by the database service.
 
 ## Running Agents
 
@@ -435,7 +439,7 @@ rootAgent, _ := llmagent.New(llmagent.Config{
 
 - A fetched card's interface URLs must share the card source's origin and use `https` (or `http` on loopback), otherwise `ErrUntrustedCardInterface`.
 - A peer's `transfer_to_agent` request is ignored unless `AllowTransferToAgent: true`.
-- For per-request auth, pass `ClientProvider: remoteagent.NewA2AClientProvider(factory)` with an `auth.Transport`-wrapped HTTP client (see `references/integrations.md`).
+- For per-request auth, pass `ClientProvider: remoteagent.NewA2AClientProvider(factory)` with an `auth.Transport`-wrapped HTTP client that refuses redirects (see `references/integrations.md`).
 
 ### Exposing an Agent (Server)
 
@@ -472,7 +476,7 @@ Statuses verified against v2.5.0 source (2026-10).
 - **v1 training data.** v1-style code fails to compile at v2: `tool.Context` / `agent.ToolContext` / `agent.CallbackContext` → `agent.Context`; `session.NewEvent(id)` → `session.NewEvent(ctx, id)`; imports need `/v2`; `telemetry.WithGenAICaptureMessageContent` is gone; `ArtifactVersion.CreateTime` is `time.Time`. Pin `google.golang.org/adk/v2` in `go.mod`.
 - **Root agent must be chat mode.** A root `llmagent` with `ModeTask` or `ModeSingleTurn` fails with `root agent X must be a chat LlmAgent`. Single_turn and task sub-agents are tools, not `transfer_to_agent` targets.
 - **Undeclared Mode depends on placement.** The same `llmagent` is chat as a sub-agent but single_turn (current turn only) as a graph node. Declare `Mode` when reusing one agent instance.
-- **Nested loop escalation ([#522](https://github.com/google/adk-go/issues/522), still present at v2.5.0).** `Escalate` inside a nested `loopagent` also stops the enclosing loop. Wrap the inner loop to clear `Escalate` on forwarded events (code in `references/orchestration.md`), or use a graph back-edge.
+- **Nested loop escalation ([#522](https://github.com/google/adk-go/issues/522), still present at v2.5.0).** `Escalate` inside a nested `loopagent` also stops the enclosing loop. Wrap the inner loop to clear `Escalate` on forwarded events (code in `references/orchestration.md`), or use a graph back-edge. Also set a finite `MaxIterations`: a sub-agent error does not stop a loop, so `0` with a persistent model error retries forever.
 - **Graph workflow results live in `event.Output`.** `NewFunctionNode` outputs have no `Content`, so loops that print only text show nothing. Composite agents wrapped as graph nodes produce `nil` output.
 - **Graph limits at v2.5.0.** Tool confirmation inside a graph agent node is not resumed (ask with `workflow.NewRequestInputEvent` or `workflow.ResumeOrRequestInput` instead); fan-in needs a `JoinNode`, and a join across a branch that pauses for input never fires after the resume; unmatched routes without `workflow.Default` dead-end silently; plain text sent while a graph is paused restarts it from `Start`.
 - **Web launcher defaults (v2.5.0).** Binds `127.0.0.1` (containers need `web -host 0.0.0.0`); cross-origin browsers get 403; bodies over 10 MiB get 400; debug/graph routes need `-include_debug_api`. REST auth is code-only and covers the REST API only (A2A and trigger routes stay open).

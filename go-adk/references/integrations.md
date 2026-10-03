@@ -210,27 +210,47 @@ fsTools, err := mcptoolset.New(mcptoolset.Config{
     },
 })
 
-// Remote streamable HTTP server with a static bearer token.
+// Remote streamable HTTP server with a static bearer token. Credentialed
+// clients must refuse redirects (see refuseRedirects below).
 ghTools, err := mcptoolset.New(mcptoolset.Config{
-    Endpoint: "https://api.githubcopilot.com/mcp/", // Shorthand for a StreamableClientTransport.
-    Auth:     auth.StaticToken(os.Getenv("GITHUB_PAT")),
+    Transport: &mcp.StreamableClientTransport{
+        Endpoint:   "https://api.githubcopilot.com/mcp/",
+        HTTPClient: &http.Client{CheckRedirect: refuseRedirects}, // Kept when Auth wraps the client.
+    },
+    Auth: auth.StaticToken(os.Getenv("GITHUB_PAT")),
 })
 
 // Header API key, or Google Application Default Credentials.
 keyed, err := mcptoolset.New(mcptoolset.Config{
-    Endpoint: "https://mcp.example.com/mcp",
-    Auth:     auth.APIKey("X-Api-Key", os.Getenv("EXAMPLE_KEY")),
+    Transport: &mcp.StreamableClientTransport{
+        Endpoint:   "https://mcp.example.com/mcp",
+        HTTPClient: &http.Client{CheckRedirect: refuseRedirects},
+    },
+    Auth: auth.APIKey("X-Api-Key", os.Getenv("EXAMPLE_KEY")),
 })
 gcpTools, err := mcptoolset.New(mcptoolset.Config{
-    Endpoint: "https://my-mcp.example.googleapis.com/mcp",
-    Auth:     auth.ADC(), // cloud-platform scope by default.
+    Transport: &mcp.StreamableClientTransport{
+        Endpoint:   "https://my-mcp.example.googleapis.com/mcp",
+        HTTPClient: &http.Client{CheckRedirect: refuseRedirects},
+    },
+    Auth: auth.ADC(), // cloud-platform scope by default.
 })
+
+// Unauthenticated servers can use the Endpoint shorthand (a default client).
+publicTools, err := mcptoolset.New(mcptoolset.Config{Endpoint: "https://mcp.example.com/public/mcp"})
 
 agent, err := llmagent.New(llmagent.Config{
     Name:     "fs_agent",
     Model:    m,
     Toolsets: []tool.Toolset{fsTools},
 })
+```
+
+**Never let a credentialed client follow redirects.** `auth.Transport` resolves and applies the credential on every request, including a redirect hop after `net/http` has stripped `Authorization`, so a redirecting endpoint would receive the token. `Config.Endpoint` builds a default `http.Client` that follows redirects; with `Auth`, pass a `StreamableClientTransport` whose `HTTPClient` refuses them:
+
+```go
+// refuseRedirects returns redirect responses to the caller instead of following them.
+func refuseRedirects(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 ```
 
 In-memory transports (`mcp.NewInMemoryTransports()`) work for tests: connect an `mcp.NewServer` to the server end and pass the client end as `Transport`. The older `HTTPClient: oauth2.NewClient(ctx, ts)` pattern on `mcp.StreamableClientTransport` still works.
@@ -252,6 +272,7 @@ Behavior notes:
 - At v2.5.0, a config with neither `Transport` nor `Endpoint` is **not** rejected by `New`; it fails later during tool discovery with a nil-pointer panic (under the runner, a run error such as `node "root" panicked: ...`). Validate your config.
 - `Auth` with a non-HTTP transport fails at construction. Do not combine `Auth` with the transport's own `OAuthHandler`.
 - Sessions are created lazily on the first LLM request and reconnect automatically on closed connections or missing sessions. Tool discovery paginates `ListTools`.
+- **Tool calls are at-least-once.** When `CallTool` fails with a closed connection, missing session, or EOF, ADK reconnects and **resends the same call once**. If the server had already executed it before the connection dropped, a mutating tool (create record, send message, charge payment) runs twice while ADK reports one result (upstream issue #1689). Make mutating MCP tools idempotent (e.g. idempotency keys), or gate them behind confirmation.
 - Results: `StructuredContent` is returned as `{"output": ...}`; otherwise text is returned as `{"output": "<text>"}`. Since v2.4.0, empty text is valid, and non-text content (images, audio, resource links) is rendered as bracketed labels instead of being dropped (binary payloads are not forwarded to the model).
 - `IsError: true` results become a tool error: `Tool execution failed. Details: ...`.
 - For HTTP servers with idle timeouts, the cached session can go stale; tune server timeouts or recreate the toolset on persistent connection errors.
@@ -299,7 +320,14 @@ type ConsentRequiredError struct{ AuthURI, Nonce, Key string }
 func NewInMemoryCredentialStore() *InMemoryCredentialStore
 ```
 
-Wrap any HTTP client: `&http.Client{Transport: &auth.Transport{Provider: auth.ADC()}}`.
+Wrap any HTTP client, and always refuse redirects on clients that carry credentials (`auth.Transport` re-applies the credential on every hop, including to another host):
+
+```go
+authed := &http.Client{
+    Transport:     &auth.Transport{Provider: auth.ADC()},
+    CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+}
+```
 
 **Per-user credentials (`auth/gcp`):** resolves end-user credentials from Google Cloud Agent Identity or IAM Connector credential services, keyed by the acting user from `agent.IdentityFromContext(ctx)`.
 
@@ -315,7 +343,13 @@ perUser, err := gcp.NewProvider(ctx, gcp.ProviderConfig{
     Client: client,
     Store:  auth.NewInMemoryCredentialStore(),
 })
-userTools, err := mcptoolset.New(mcptoolset.Config{Endpoint: "https://mcp.example.com/mcp", Auth: perUser})
+userTools, err := mcptoolset.New(mcptoolset.Config{
+    Transport: &mcp.StreamableClientTransport{
+        Endpoint:   "https://mcp.example.com/mcp",
+        HTTPClient: &http.Client{CheckRedirect: refuseRedirects}, // Required by gcp.NewProvider.
+    },
+    Auth: perUser,
+})
 ```
 
 - The provider fails with `gcp.ErrNoActingUser` when the context carries no ADK identity. ADK does **not** authenticate `session.UserID`; trust comes from your server's authentication.
@@ -345,7 +379,10 @@ remote, err := remoteagent.NewA2A(remoteagent.A2AConfig{
 ```go
 import "github.com/a2aproject/a2a-go/v2/a2aclient"
 
-hc := &http.Client{Transport: &auth.Transport{Provider: auth.StaticToken(os.Getenv("REMOTE_TOKEN"))}}
+hc := &http.Client{
+    Transport:     &auth.Transport{Provider: auth.StaticToken(os.Getenv("REMOTE_TOKEN"))},
+    CheckRedirect: refuseRedirects, // Never forward the token to a redirect target.
+}
 factory := a2aclient.NewFactory(a2aclient.WithJSONRPCTransport(hc), a2aclient.WithRESTTransport(hc))
 remote, err := remoteagent.NewA2A(remoteagent.A2AConfig{
     Name:              "prime_agent",
@@ -378,7 +415,10 @@ for srv, err := range reg.AllMCPServers(ctx, agentregistry.WithPageSize(50)) {
 }
 
 remote, err := reg.RemoteAgent(ctx, "projects/p/locations/global/agents/my-agent",
-    agentregistry.WithA2AHTTPClient(&http.Client{Transport: &auth.Transport{Provider: auth.ADC()}}))
+    agentregistry.WithA2AHTTPClient(&http.Client{
+        Transport:     &auth.Transport{Provider: auth.ADC()},
+        CheckRedirect: refuseRedirects,
+    }))
 ```
 
 - Discovery: `ListAgents`/`GetAgent`/`AllAgents`, `ListMCPServers`/`GetMCPServer`/`AllMCPServers`, `ListEndpoints`/`GetEndpoint`/`AllEndpoints`; options `WithFilter`, `WithPageSize`, `WithPageToken`. Non-2xx responses are `*agentregistry.APIError`.

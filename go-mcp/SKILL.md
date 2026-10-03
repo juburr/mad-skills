@@ -468,7 +468,7 @@ return &mcp.CallToolResult{
 }, nil, nil
 ```
 
-Keys under `io.modelcontextprotocol/` are reserved: on 2026-07-28 sessions the SDK writes the protocol version, client info, and capabilities into request `_meta` and `io.modelcontextprotocol/serverInfo` into result `_meta`. Use your own prefix (e.g., `security:`). For distributed tracing, propagate W3C `traceparent`/`tracestate`/`baggage` keys in `_meta`.
+Prefixes whose second label is `modelcontextprotocol` or `mcp` (such as `io.modelcontextprotocol/`) are reserved: on 2026-07-28 sessions the SDK writes the protocol version, client info, and capabilities into request `_meta` and `io.modelcontextprotocol/serverInfo` into result `_meta`. Use your own reverse-DNS prefix ending in `/` (e.g., `com.example.security/level`); the name after the prefix may contain only alphanumerics, `-`, `_`, and `.`. For distributed tracing, propagate W3C `traceparent`/`tracestate`/`baggage` keys in `_meta`.
 
 ## Logging
 

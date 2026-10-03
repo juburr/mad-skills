@@ -6,17 +6,17 @@ Sensitivity labeling, JWT-based row-level security, and mTLS patterns for MCP se
 
 ## Sensitivity Labels in `_meta`
 
-MCP's `CallToolResult` has a `Meta` field (JSON `_meta`) for arbitrary metadata. Use `security:`-namespaced keys for sensitivity data to avoid collisions with other metadata consumers.
+MCP's `CallToolResult` has a `Meta` field (JSON `_meta`) for arbitrary metadata. Use a reverse-DNS key prefix you control (here `com.example.security/`; replace `com.example` with your organization's domain) to avoid collisions with other metadata consumers. MCP key names allow only alphanumerics, `-`, `_`, and `.` after the prefix, so a colon form like `security:level` is not a valid key.
 
 ### Schema
 
 ```json
 {
   "_meta": {
-    "security:level":        "confidential",
-    "security:portion_mark": "(C)",
-    "security:handling":     ["no-export", "need-to-know"],
-    "security:policy":       "data-governance-2024"
+    "com.example.security/level":        "confidential",
+    "com.example.security/portion_mark": "(C)",
+    "com.example.security/handling":     ["no-export", "need-to-know"],
+    "com.example.security/policy":       "data-governance-2024"
   },
   "content": [...]
 }
@@ -24,10 +24,10 @@ MCP's `CallToolResult` has a `Meta` field (JSON `_meta`) for arbitrary metadata.
 
 | Field | Required | Description |
 |---|---|---|
-| `security:level` | Yes | Sensitivity level for this tool result |
-| `security:portion_mark` | No | Inline marker for the content (e.g., `(C)`, `(I)`) |
-| `security:handling` | No | Handling restrictions (e.g., `no-export`, `need-to-know`, `pii`) |
-| `security:policy` | No | Reference to the governing data classification policy |
+| `com.example.security/level` | Yes | Sensitivity level for this tool result |
+| `com.example.security/portion_mark` | No | Inline marker for the content (e.g., `(C)`, `(I)`) |
+| `com.example.security/handling` | No | Handling restrictions (e.g., `no-export`, `need-to-know`, `pii`) |
+| `com.example.security/policy` | No | Reference to the governing data classification policy |
 
 ### Server-Side: Returning Labels
 
@@ -38,8 +38,8 @@ func queryHandler(ctx context.Context, req *mcp.CallToolRequest, input QueryInpu
 
     return &mcp.CallToolResult{
         Meta: mcp.Meta{
-            "security:level":    maxLevel,
-            "security:handling": handling,
+            "com.example.security/level":    maxLevel,
+            "com.example.security/handling": handling,
         },
         Content: []mcp.Content{&mcp.TextContent{Text: formatResults(rows)}},
     }, nil, nil
@@ -118,13 +118,13 @@ func sensitivityCallback(tracker *Tracker) func(toolName string, result *mcp.Cal
         if meta == nil {
             return
         }
-        level, ok := meta["security:level"].(string)
+        level, ok := meta["com.example.security/level"].(string)
         if !ok {
             return
         }
         tracker.Record(toolName, Parse(level))
 
-        if handling, ok := meta["security:handling"].([]any); ok {
+        if handling, ok := meta["com.example.security/handling"].([]any); ok {
             tracker.RecordHandling(toolName, handling)
         }
     }
@@ -289,13 +289,13 @@ server := mcp.NewServer(impl, &mcp.ServerOptions{
 
 ### Alternative: JWT in `_meta`
 
-For stdio transports where HTTP headers are unavailable, pass the JWT in the `_meta` field. Use your own key prefix: keys under `io.modelcontextprotocol/` are reserved, and on 2026-07-28 the SDK already writes protocol data there.
+For stdio transports where HTTP headers are unavailable, pass the JWT in the `_meta` field. Use your own reverse-DNS key prefix: prefixes whose second label is `modelcontextprotocol` or `mcp` (such as `io.modelcontextprotocol/`) are reserved, and on 2026-07-28 the SDK already writes protocol data there.
 
 ```go
 result, _ := session.CallTool(ctx, &mcp.CallToolParams{
     Name:      "query",
     Arguments: map[string]any{"q": "search term"},
-    Meta:      mcp.Meta{"example.com/auth_token": jwt},
+    Meta:      mcp.Meta{"com.example/auth_token": jwt},
 })
 ```
 
@@ -303,7 +303,7 @@ Server-side extraction:
 
 ```go
 func handler(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-    token, _ := req.Params.Meta["example.com/auth_token"].(string)
+    token, _ := req.Params.Meta["com.example/auth_token"].(string)
     claims, err := validateJWT(token) // must reject an empty or invalid token
     if err != nil {
         return nil, &jsonrpc.Error{Code: jsonrpc.CodeInvalidRequest, Message: "unauthenticated"}
@@ -392,7 +392,7 @@ User ──► Agent API (HTTPS)                                   ┌───�
               │  caller JWT forwarded                                     │
               ▼                                                           │
          MCP Server  (auth.RequireBearerToken, RLS by JWT claims)         │
-              │  CallToolResult{_meta: {"security:level": ...}}           │
+              │  CallToolResult _meta {"com.example.security/level": ...} │
               ▼                                                           │
          MCP client result callback ── reads _meta labels ────────────────┘
 

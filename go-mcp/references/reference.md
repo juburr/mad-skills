@@ -683,6 +683,9 @@ handler, err := auth.NewAuthorizationCodeHandler(&auth.AuthorizationCodeHandlerC
         Metadata: &oauthex.ClientRegistrationMetadata{
             ClientName:   "my-client",
             RedirectURIs: []string{"http://localhost:8089/callback"}, // required for DCR
+            // RequestRefreshToken only adds offline_access; DCR clients must also
+            // register the refresh_token grant (listing replaces the default).
+            GrantTypes: []string{"authorization_code", "refresh_token"},
         },
     },
     // Required unless inferred from DCR RedirectURIs; with DCR set, must be in that list.

@@ -414,15 +414,14 @@ middleware := auth.RequireBearerToken(verifier, &auth.RequireBearerTokenOptions{
 http.Handle("/mcp", middleware(mcpHandler))
 ```
 
-Access token info inside tool handlers via `req.Extra.TokenInfo` (`auth.TokenInfoFromContext(ctx)` also works over Streamable HTTP):
+Read token info inside tool handlers from `req.Extra`, which is set per request. Avoid `auth.TokenInfoFromContext(ctx)` there: on a stateful handler, `ctx` carries the values of the request that created the session, so the token can be stale.
 
 ```go
 func myTool(ctx context.Context, req *mcp.CallToolRequest, input MyInput) (*mcp.CallToolResult, any, error) {
-    info := req.Extra.TokenInfo
-    if info == nil {
+    if req.Extra == nil || req.Extra.TokenInfo == nil { // Extra is nil on stdio/in-memory
         return nil, nil, &jsonrpc.Error{Code: jsonrpc.CodeInvalidRequest, Message: "unauthenticated"}
     }
-    tenantID, _ := info.Extra["tenant_id"].(string)
+    tenantID, _ := req.Extra.TokenInfo.Extra["tenant_id"].(string)
     // Use tenantID for RLS, scoping queries, etc.
 }
 ```

@@ -103,8 +103,10 @@ req.ProtocolVersion() string                  // negotiated version for this req
 req.ClientInfo() *mcp.Implementation          // from per-request _meta, else initialize
 req.ClientCapabilities() *mcp.ClientCapabilities
 req.Extra.TokenInfo                           // *auth.TokenInfo from RequireBearerToken, if any
-req.Extra.Header                              // http.Header of the HTTP request, if any
+req.Extra.Header                              // http.Header of the HTTP request
 ```
+
+`req.Extra` is nil on non-HTTP transports (stdio, in-memory); check it before dereferencing. Over HTTP it is populated per request, whereas on a stateful handler the handler's `ctx` carries context values from the request that created the session — read per-request data (token, headers) from `req.Extra`, not from `ctx`.
 
 ## Content Types
 

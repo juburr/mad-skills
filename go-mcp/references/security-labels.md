@@ -245,11 +245,12 @@ On the MCP server, extract the JWT from the request, validate it, and use claims
 
 ```go
 func queryTool(ctx context.Context, req *mcp.CallToolRequest, input QueryInput) (*mcp.CallToolResult, any, error) {
-    info := req.Extra.TokenInfo // set by auth.RequireBearerToken; nil without it
-    if info == nil {
+    // req.Extra is nil on non-HTTP transports (stdio, in-memory); TokenInfo is
+    // nil unless auth.RequireBearerToken wraps the handler.
+    if req.Extra == nil || req.Extra.TokenInfo == nil {
         return nil, nil, &jsonrpc.Error{Code: jsonrpc.CodeInvalidRequest, Message: "unauthenticated"}
     }
-    tenantID, ok := info.Extra["tenant_id"].(string)
+    tenantID, ok := req.Extra.TokenInfo.Extra["tenant_id"].(string)
     if !ok || tenantID == "" {
         return nil, nil, &jsonrpc.Error{Code: jsonrpc.CodeInvalidRequest, Message: "token missing tenant"}
     }
@@ -260,7 +261,7 @@ func queryTool(ctx context.Context, req *mcp.CallToolRequest, input QueryInput) 
 }
 ```
 
-Fail closed: a missing token or claim must never fall through to an unscoped query. `auth.TokenInfoFromContext(ctx)` returns the same value over Streamable HTTP.
+Fail closed: a missing token or claim must never fall through to an unscoped query. Read the token from `req.Extra`, which is populated per request. Do not use `auth.TokenInfoFromContext(ctx)` in tool handlers: on a stateful Streamable HTTP handler, the handler context carries the values of the request that *created the session*, so it can return a stale or expired token.
 
 ### Cache Scope for Access-Controlled Data
 
@@ -374,27 +375,26 @@ The same TLS configuration works for both MCP (Streamable HTTP) and A2A connecti
 ## Complete Composition
 
 ```
-Inbound request                          Outbound response
-───────────────                          ─────────────────
+User ──► Agent API (HTTPS)                                   ┌─────────────────────────┐
+         wrapped in SensitivityMiddleware ◄── reads HWM ──── │ Tracker                 │
+              │                                              └────────────▲────────────┘
+              ▼                                                           │ Record()
+         Agent pipeline (LLM + MCP client)                                │
+              │  tools/call over mTLS,                                    │
+              │  caller JWT forwarded                                     │
+              ▼                                                           │
+         MCP Server  (auth.RequireBearerToken, RLS by JWT claims)         │
+              │  CallToolResult{_meta: {"security:level": ...}}           │
+              ▼                                                           │
+         MCP client result callback ── reads _meta labels ────────────────┘
 
-Client ──────► mTLS handshake            X-Sensitivity: confidential
-               JWT extracted              X-Sensitivity-Sources: [...]
-               validated via auth pkg
-                    │
-                    ▼                    // SENSITIVITY: confidential [need-to-know] //
-            ┌───────────────┐
-            │  MCP Server   │            { response body with
-            │  Tool handlers│              portion marks preserved }
-            │  _meta has     │                    ▲
-            │  per-tool      │                    │
-            │  labels        │           ┌────────┴────────────┐
-            │               │           │ Sensitivity          │
-            │  callbacks    │           │ Middleware            │
-            │  update       │──────────►│                      │
-            │  tracker      │  tool     │ reads tracker HWM    │
-            └───────────────┘  results  │ stamps HTTP headers  │
-                                        │ prepends banner      │
-                                        └──────────────────────┘
+Response to user:
+  X-Sensitivity: confidential               (stamped by SensitivityMiddleware)
+  X-Sensitivity-Sources: [...]
+  // SENSITIVITY: confidential [need-to-know] //
+  { response body with portion marks preserved }
 ```
+
+The MCP hop is never rewritten: labels travel in `_meta`, and only the agent's user-facing response gets headers and a banner.
 
 Key principle: the LLM produces content and preserves portion marks. Infrastructure stamps sensitivity labels. These concerns never mix.

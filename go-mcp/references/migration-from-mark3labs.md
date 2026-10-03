@@ -424,6 +424,17 @@ http.ListenAndServe(":8080", httpServer)
 
 **After:**
 ```go
+// Replaces WithHTTPContextFunc: rebuild the handler context from each request,
+// so existing tool handlers that read the tenant from ctx keep working.
+s.AddReceivingMiddleware(func(next mcp.MethodHandler) mcp.MethodHandler {
+    return func(ctx context.Context, method string, req mcp.Request) (mcp.Result, error) {
+        if extra := req.GetExtra(); extra != nil && extra.Header != nil { // nil on stdio/in-memory
+            ctx = withTenant(ctx, extra.Header.Get("X-Tenant-ID"))
+        }
+        return next(ctx, method, req)
+    }
+})
+
 handler := mcp.NewStreamableHTTPHandler(
     func(req *http.Request) *mcp.Server { return s },
     &mcp.StreamableHTTPOptions{Stateless: true},
@@ -432,7 +443,9 @@ http.Handle("/mcp", handler)
 http.ListenAndServe(":8080", nil)
 ```
 
-- The `getServer` callback replaces context functions. It receives the HTTP request and returns a `*Server`, enabling per-request server instances for multi-tenant deployments. Request headers are also available in handlers as `req.Extra.Header`.
+- Use a receiving middleware, not an HTTP middleware that calls `r.WithContext(...)`, to replace a context function. `req.GetExtra()` (`Header`, `TokenInfo`) is populated for every request, whereas on a *stateful* handler the tool handler's `ctx` carries the values of the request that created the session, so per-request values set by HTTP middleware go stale.
+- The example keeps the original header-based tenant to stay behavior-compatible. A client-supplied header is not an identity: in production derive the tenant from the verified token (`extra.TokenInfo`, set by `auth.RequireBearerToken`) and reject requests without one.
+- The `getServer` callback also receives the HTTP request, enabling per-request server instances (e.g., a tool set per tenant).
 - Set `Stateless: true` for new deployments — it is the only mode that serves protocol 2026-07-28. A stateful handler (the default) still serves 2025-11-25 and older clients; use it only if you depend on session IDs or legacy server-to-client requests.
 
 ### SSE Server
@@ -738,10 +751,13 @@ session := server.ClientSessionFromContext(ctx)
 **After:**
 ```go
 func handler(ctx context.Context, req *mcp.CallToolRequest, in Input) (*mcp.CallToolResult, any, error) {
-    ss := req.Session                // *mcp.ServerSession
-    caller := req.ClientInfo()       // client name/version
-    token := req.Extra.TokenInfo     // from auth.RequireBearerToken
-    tenant := req.Extra.Header.Get("X-Tenant-ID")
+    ss := req.Session          // *mcp.ServerSession
+    caller := req.ClientInfo() // client name/version
+    if req.Extra != nil {      // nil on stdio and in-memory transports
+        token := req.Extra.TokenInfo // from auth.RequireBearerToken; may be nil
+        tenant := req.Extra.Header.Get("X-Tenant-ID")
+        // ...
+    }
     // ...
 }
 ```

@@ -1,6 +1,6 @@
 # Security Labels
 
-> Verified against SDK v1.6.1.
+> Verified against SDK v1.8.0.
 
 Sensitivity labeling, JWT-based row-level security, and mTLS patterns for MCP servers. These patterns apply to any multi-tenant system requiring data-level access control and response-level security labeling — enterprise data governance, regulated industries, or internal sensitivity tiers.
 
@@ -245,24 +245,48 @@ On the MCP server, extract the JWT from the request, validate it, and use claims
 
 ```go
 func queryTool(ctx context.Context, req *mcp.CallToolRequest, input QueryInput) (*mcp.CallToolResult, any, error) {
-    info := auth.TokenInfoFromContext(ctx)
-    tenantID := info.Extra["tenant_id"].(string)
+    info := req.Extra.TokenInfo // set by auth.RequireBearerToken; nil without it
+    if info == nil {
+        return nil, nil, &jsonrpc.Error{Code: jsonrpc.CodeInvalidRequest, Message: "unauthenticated"}
+    }
+    tenantID, ok := info.Extra["tenant_id"].(string)
+    if !ok || tenantID == "" {
+        return nil, nil, &jsonrpc.Error{Code: jsonrpc.CodeInvalidRequest, Message: "token missing tenant"}
+    }
 
     // Postgres RLS: SET app.tenant_id = tenantID
-    rows, _ := db.QueryContext(ctx, "SELECT * FROM records WHERE $1 = $1", tenantID)
+    rows, err := db.QueryContext(ctx, "SELECT * FROM records WHERE $1 = $1", tenantID)
     // ... format and return
 }
 ```
 
+Fail closed: a missing token or claim must never fall through to an unscoped query. `auth.TokenInfoFromContext(ctx)` returns the same value over Streamable HTTP.
+
+### Cache Scope for Access-Controlled Data
+
+Under protocol 2026-07-28, list results and `resources/read` results carry `ttlMs` and `cacheScope`, and the SDK defaults `cacheScope` to `"public"` — meaning shared intermediaries may cache and serve the response to other users. Mark anything filtered by the caller's identity as `"private"`:
+
+```go
+server := mcp.NewServer(impl, &mcp.ServerOptions{
+    SetCacheable: func(_ context.Context, req mcp.Request, c *mcp.Cacheable) {
+        if extra := req.GetExtra(); extra != nil && extra.TokenInfo != nil {
+            c.CacheScope = "private"
+        }
+    },
+})
+```
+
+Keep `ttlMs` at `0` (the default) for results whose sensitivity labels can change.
+
 ### Alternative: JWT in `_meta`
 
-For stdio transports where HTTP headers are unavailable, pass the JWT in the `_meta` field:
+For stdio transports where HTTP headers are unavailable, pass the JWT in the `_meta` field. Use your own key prefix: keys under `io.modelcontextprotocol/` are reserved, and on 2026-07-28 the SDK already writes protocol data there.
 
 ```go
 result, _ := session.CallTool(ctx, &mcp.CallToolParams{
     Name:      "query",
     Arguments: map[string]any{"q": "search term"},
-    Meta:      mcp.Meta{"auth_token": jwt},
+    Meta:      mcp.Meta{"example.com/auth_token": jwt},
 })
 ```
 
@@ -270,8 +294,11 @@ Server-side extraction:
 
 ```go
 func handler(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-    token := req.Params.Meta["auth_token"].(string)
-    claims := validateJWT(token)
+    token, _ := req.Params.Meta["example.com/auth_token"].(string)
+    claims, err := validateJWT(token) // must reject an empty or invalid token
+    if err != nil {
+        return nil, &jsonrpc.Error{Code: jsonrpc.CodeInvalidRequest, Message: "unauthenticated"}
+    }
     // ... use claims for RLS
 }
 ```
@@ -332,7 +359,7 @@ session, _ := client.Connect(ctx, &mcp.StreamableClientTransport{
 ```go
 server := &http.Server{
     Addr:    ":8443",
-    Handler: sensitivityMiddleware(tracker, mcpHandler),
+    Handler: authMiddleware(mcpHandler), // e.g., auth.RequireBearerToken
     TLSConfig: &tls.Config{
         ClientAuth: tls.RequireAndVerifyClientCert,
         ClientCAs:  caPool,
@@ -342,7 +369,7 @@ server := &http.Server{
 server.ListenAndServeTLS("/certs/server.crt", "/certs/server.key")
 ```
 
-The same TLS configuration works for both MCP (Streamable HTTP) and A2A connections since both run over standard HTTPS.
+The same TLS configuration works for both MCP (Streamable HTTP) and A2A connections since both run over standard HTTPS. Do not wrap the MCP endpoint itself in `SensitivityMiddleware`: it buffers the response and prepends a text banner, which breaks JSON-RPC and SSE framing. Apply it to the agent's user-facing API; MCP responses carry labels in `_meta`.
 
 ## Complete Composition
 

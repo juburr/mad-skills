@@ -1,6 +1,6 @@
 # API Reference
 
-Complete type reference for ADK Go. Verified against `google.golang.org/adk` v1.4.0.
+Type reference for ADK Go. Verified against `google.golang.org/adk/v2` v2.5.0. All import paths below start with `google.golang.org/adk/v2/`.
 
 ## Core Interfaces
 
@@ -12,11 +12,11 @@ type Agent interface {
     Description() string
     Run(InvocationContext) iter.Seq2[*session.Event, error]
     SubAgents() []Agent
-    FindAgent(name string) Agent     // Recursive lookup by name (v1.1.0+).
+    FindAgent(name string) Agent    // Recursive lookup by name.
     FindSubAgent(name string) Agent
 
     // Has an unexported method: user code CANNOT implement this interface.
-    // Always construct agents via agent.New, llmagent.New, or workflow constructors.
+    // Construct agents via agent.New, llmagent.New, workflowagent.New, or workflow agent constructors.
 }
 ```
 
@@ -27,9 +27,14 @@ type LLM interface {
     Name() string
     GenerateContent(ctx context.Context, req *LLMRequest, stream bool) iter.Seq2[*LLMResponse, error]
 }
+
+// Name-based registry (v2.1.0). Opt-in: providers do not self-register.
+type Factory func(ctx context.Context, name string) (LLM, error)
+func Register(namePattern string, f Factory)              // Unanchored regexp; panics on invalid/duplicate.
+func NewLLM(ctx context.Context, name string) (LLM, error) // Exactly one pattern must match.
 ```
 
-### tool.Tool
+### tool.Tool and tool.Toolset
 
 ```go
 type Tool interface {
@@ -37,15 +42,29 @@ type Tool interface {
     Description() string
     IsLongRunning() bool
 }
-```
 
-### tool.Toolset
-
-```go
 type Toolset interface {
     Name() string
     Tools(ctx agent.ReadonlyContext) ([]Tool, error)
 }
+```
+
+A hand-written tool (instead of `functiontool`) must also implement these methods, or the flow fails with `tool "X" does not implement RequestProcessor() method`:
+
+```go
+ProcessRequest(ctx agent.Context, req *model.LLMRequest) error   // Usually: return toolutils.PackTool(req, t)
+Declaration() *genai.FunctionDeclaration
+Run(ctx agent.Context, args any) (map[string]any, error)
+RunStream(ctx agent.Context, args any) iter.Seq2[string, error]  // Optional: streaming tools.
+```
+
+```go
+// tool/toolutils (v2.1.0)
+type Tool interface {
+    Name() string
+    Declaration() *genai.FunctionDeclaration
+}
+func PackTool(req *model.LLMRequest, t Tool) error // Registers t and appends its declaration; errors on duplicate names.
 ```
 
 ## agent.Config
@@ -58,133 +77,109 @@ type Config struct {
     Description          string
     SubAgents            []Agent
     BeforeAgentCallbacks []BeforeAgentCallback
-    AfterAgentCallbacks  []AfterAgentCallback
     Run                  func(InvocationContext) iter.Seq2[*session.Event, error]
+    AfterAgentCallbacks  []AfterAgentCallback
 }
+func New(cfg Config) (Agent, error) // Errors if a sub-agent appears twice.
 ```
 
 ## llmagent.Config
 
-All fields for `llmagent.New()`.
-
 ```go
 type Config struct {
     // Identity
-    Name        string          // Required. Unique in agent tree. Cannot be "user".
-    Description string          // Used by parent agents for delegation routing.
+    Name        string        // Required. Unique in the agent tree. Cannot be "user".
+    Description string        // One line; used by parents to decide delegation.
+    SubAgents   []agent.Agent
 
-    // Model
-    Model                   model.LLM
-    GenerateContentConfig   *genai.GenerateContentConfig
-
-    // Instructions
-    Instruction               string               // Supports {state_key} substitution.
-    InstructionProvider       InstructionProvider   // Dynamic instruction generation.
-    GlobalInstruction         string               // Prepended to all sub-agent instructions.
-    GlobalInstructionProvider InstructionProvider
-
-    // Sub-Agents
-    SubAgents                []agent.Agent
-    DisallowTransferToParent bool     // Prevent delegating back to parent.
-    DisallowTransferToPeers  bool     // Prevent delegating to siblings.
-
-    // Tools
-    Tools                []tool.Tool
-    Toolsets              []tool.Toolset
-
-    // Schema
-    InputSchema  *genai.Schema    // Structured input validation.
-    OutputSchema *genai.Schema    // Structured output. Note: disables tool use.
-
-    // Output
-    OutputKey       string           // Stores final response in state[OutputKey].
-    IncludeContents IncludeContents  // "none" or "default".
-
-    // Agent Callbacks
     BeforeAgentCallbacks []agent.BeforeAgentCallback
     AfterAgentCallbacks  []agent.AfterAgentCallback
 
-    // Model Callbacks
+    // Model
+    GenerateContentConfig *genai.GenerateContentConfig // Tools must go in Tools, not here.
     BeforeModelCallbacks  []BeforeModelCallback
+    Model                 model.LLM
     AfterModelCallbacks   []AfterModelCallback
     OnModelErrorCallbacks []OnModelErrorCallback
 
-    // Tool Callbacks
+    // Instructions. {key} from state, {key?} optional, {artifact.name} artifact text.
+    // Keys must match ^[a-zA-Z_][a-zA-Z0-9_]*$ (others are left literal). A missing non-optional key is an error.
+    Instruction               string
+    InstructionProvider       InstructionProvider // Replaces Instruction; NO {key} substitution.
+    GlobalInstruction         string              // Only the root agent's global instruction takes effect.
+    GlobalInstructionProvider InstructionProvider
+
+    // Delegation
+    DisallowTransferToParent bool
+    DisallowTransferToPeers  bool
+
+    // Unset: history for conversational agents; current turn only for single_turn graph nodes.
+    // IncludeContentsDefault keeps history even there; IncludeContentsNone = current turn only.
+    IncludeContents IncludeContents
+
+    InputSchema  *genai.Schema // Parameters when used as a tool / single_turn / task sub-agent.
+    OutputSchema *genai.Schema // Structured output. Tools and transfers still work (see below).
+
+    // Tools
     BeforeToolCallbacks  []BeforeToolCallback
+    Tools                []tool.Tool
     AfterToolCallbacks   []AfterToolCallback
+    Toolsets             []tool.Toolset
     OnToolErrorCallbacks []OnToolErrorCallback
+
+    OutputKey string // Final text response saved to state[OutputKey].
+
+    // v2.0.0. ModeChat: reachable via transfer_to_agent. ModeTask: chats with the user, returns via finish_task.
+    // ModeSingleTurn: completes without user interaction. Default: chat as root/sub-agent, single_turn as a graph node.
+    Mode Mode
 }
-```
 
-### InstructionProvider
+type Mode = llminternal.Mode // Underlying type is string, so Mode: "task" also compiles.
+const (
+    ModeUnset      // ""
+    ModeChat       // "chat"
+    ModeTask       // "task"
+    ModeSingleTurn // "single_turn"
+)
 
-```go
+type IncludeContents string
+const (
+    IncludeContentsNone    IncludeContents = "none"
+    IncludeContentsDefault IncludeContents = "default"
+)
+
 type InstructionProvider func(ctx agent.ReadonlyContext) (string, error)
 ```
 
+**OutputSchema behavior:** with no tools, ADK sets `ResponseSchema` directly. With tools on Vertex AI Gemini 2.0+, the native schema is used alongside tools. With tools on any other Gemini model (including every Gemini API model), ADK injects a `set_model_response` tool and turns its arguments into the final JSON text. Non-Gemini models get `ResponseSchema` alongside tools. On the chat path, `OutputKey` stores the raw JSON **string**; on the single_turn path the parsed, validated object is stored.
+
+Exported helpers for running an LLM agent as a workflow node: `llmagent.RunLLMAgentAsNode`, `PrepareLLMAgentInput`, `ProcessLLMAgentOutput`.
+
 ## Callback Signatures
 
-### Agent Callbacks
+All callbacks take the unified `agent.Context` (v2.0.0+).
 
 ```go
-// Return non-nil *genai.Content to skip agent execution.
-type BeforeAgentCallback func(CallbackContext) (*genai.Content, error)
+// package agent
+type BeforeAgentCallback func(Context) (*genai.Content, error) // Non-nil content skips the agent run.
+type AfterAgentCallback func(Context) (*genai.Content, error)  // Non-nil content is emitted as an extra event.
 
-// Called after agent completes.
-type AfterAgentCallback func(CallbackContext) (*genai.Content, error)
+// package llmagent
+// Non-nil response or error replaces the model call.
+type BeforeModelCallback func(ctx agent.Context, llmRequest *model.LLMRequest) (*model.LLMResponse, error)
+// Non-nil response or error replaces the model response.
+type AfterModelCallback func(ctx agent.Context, llmResponse *model.LLMResponse, llmResponseError error) (*model.LLMResponse, error)
+type OnModelErrorCallback func(ctx agent.Context, llmRequest *model.LLMRequest, llmResponseError error) (*model.LLMResponse, error)
+
+// A non-nil map is used as the tool RESULT and the tool is skipped.
+// To modify args and still run the tool, mutate args in place and return (nil, nil).
+type BeforeToolCallback func(ctx agent.Context, tool tool.Tool, args map[string]any) (map[string]any, error)
+// Non-nil result or error replaces the tool output.
+type AfterToolCallback func(ctx agent.Context, tool tool.Tool, args, result map[string]any, err error) (map[string]any, error)
+type OnToolErrorCallback func(ctx agent.Context, tool tool.Tool, args map[string]any, err error) (map[string]any, error)
 ```
 
-### Model Callbacks
-
-```go
-// Return non-nil *model.LLMResponse to skip the actual model call.
-type BeforeModelCallback func(
-    ctx agent.CallbackContext,
-    llmRequest *model.LLMRequest,
-) (*model.LLMResponse, error)
-
-// Called after LLM response. Can modify the response.
-type AfterModelCallback func(
-    ctx agent.CallbackContext,
-    llmResponse *model.LLMResponse,
-    llmResponseError error,
-) (*model.LLMResponse, error)
-
-// Called when the model returns an error.
-type OnModelErrorCallback func(
-    ctx agent.CallbackContext,
-    llmRequest *model.LLMRequest,
-    llmResponseError error,
-) (*model.LLMResponse, error)
-```
-
-### Tool Callbacks
-
-```go
-// Return modified args or error. Non-nil result map skips tool execution.
-type BeforeToolCallback func(
-    ctx tool.Context,
-    tool tool.Tool,
-    args map[string]any,
-) (map[string]any, error)
-
-// Can modify or replace the tool result.
-type AfterToolCallback func(
-    ctx tool.Context,
-    tool tool.Tool,
-    args map[string]any,
-    result map[string]any,
-    err error,
-) (map[string]any, error)
-
-// Called when tool execution errors.
-type OnToolErrorCallback func(
-    ctx tool.Context,
-    tool tool.Tool,
-    args map[string]any,
-    err error,
-) (map[string]any, error)
-```
+In each callback list, the first callback returning a non-nil value (or error) stops the chain. A `BeforeAgentCallback` returning an error surfaces the error but does not stop the agent; only non-nil content short-circuits it.
 
 ## Context Interfaces
 
@@ -204,17 +199,9 @@ type ReadonlyContext interface {
 }
 ```
 
-### agent.CallbackContext
-
-```go
-type CallbackContext interface {
-    ReadonlyContext
-    Artifacts() Artifacts
-    State() session.State
-}
-```
-
 ### agent.InvocationContext
+
+Received by custom agents' `Run` and plugin run-level callbacks.
 
 ```go
 type InvocationContext interface {
@@ -225,56 +212,105 @@ type InvocationContext interface {
     Session() session.Session
     InvocationID() string
     Branch() string
+    IsolationScope() string                       // v2.0.0
     UserContent() *genai.Content
     RunConfig() *RunConfig
     EndInvocation()
     Ended() bool
-    WithContext(context.Context) InvocationContext
+    ResumedInput(interruptID string) (any, bool)  // v2.0.0: workflow HITL resume.
+    WithContext(ctx context.Context) InvocationContext
+    WithICDelta(d *InvocationContextDelta) InvocationContext // v2.0.0
 }
 ```
 
-### agent.ToolContext (alias: tool.Context)
+### agent.Context (v2.0.0)
+
+The single context type passed to tools and all callbacks. Replaces v1's `agent.CallbackContext`, `agent.ToolContext`, and `tool.Context`.
 
 ```go
-type ToolContext interface {
-    CallbackContext
+type Context interface {
+    ReadonlyContext
+    InvocationContext
+
+    Artifacts() Artifacts
+    State() session.State // Writes become the event's StateDelta.
+
+    // Tool section
     FunctionCallID() string
     Actions() *session.EventActions
     SearchMemory(ctx context.Context, query string) (*memory.SearchResponse, error)
     ToolConfirmation() *toolconfirmation.ToolConfirmation
     RequestConfirmation(hint string, payload any) error
+
+    // Workflow node section
+    ResumedInput(interruptID string) (any, bool)
+    Path() string
+    RunID() string
+    SubScheduler() DynamicSubScheduler
+    WithAgentContext(ctx context.Context) Context
+    WithAgentTimeout(timeout time.Duration) (Context, context.CancelFunc)
+    WithAgentCancel() (Context, context.CancelFunc)
+    OutputForAncestors() []string
+    WithDelta(d *CommonContextDelta) Context
 }
 ```
 
-Since v1.4.0, `tool.Context` is a deprecated type alias (`type Context = agent.ToolContext`); existing code compiles unchanged, but `agent.ToolContext` is the canonical name. Constructors for tests/embedding: `agent.NewToolContext`, `agent.NewCallbackContext`.
+**Inert methods.** Every method compiles everywhere, but some return nil (and log a warning) depending on where the context comes from:
+
+| Where | Returns nil / no-op | Works |
+|---|---|---|
+| Agent and model callbacks | `Agent()`, `Session()`, `Memory()`, `RunConfig()`, `Actions()`, `FunctionCallID()`, `EndInvocation()`, `SearchMemory`, `RequestConfirmation` | `State()`, `ReadonlyState()`, `Artifacts()`, identity accessors (`AgentName()`, `UserID()`, `SessionID()`, ...) |
+| Tools and tool callbacks | `Agent()`, `Session()`, `Memory()`, `RunConfig()`, `EndInvocation()`, `ResumedInput()` | `State()`, `Actions()`, `Artifacts()`, `SearchMemory`, `FunctionCallID`, `ToolConfirmation`, `RequestConfirmation`, identity accessors |
+
+Use `ctx.AgentName()` (not `ctx.Agent().Name()`), `ctx.State()` (not `ctx.Session().State()`), and `ctx.SearchMemory(...)` (not `ctx.Memory()`). `ctx.Artifacts()` is nil when the runner has no `ArtifactService`.
+
+```go
+// Constructors for tests and embedding.
+func NewToolContext(ic InvocationContext, functionCallID string, actions *session.EventActions,
+    confirmation *toolconfirmation.ToolConfirmation) Context
+func NewCallbackContext(ic InvocationContext, actions *session.EventActions) Context
+
+// v2.5.0: recover the acting identity from any context derived from an ADK context
+// (e.g. inside an http.RoundTripper under a tool call). Not an authentication boundary.
+type Identity struct{ UserID, AppName, SessionID string }
+func IdentityFromContext(ctx context.Context) (Identity, bool)
+
+// Test double: embed it and override only what the test uses; other methods panic.
+type StrictContextMock struct{ Ctx context.Context }
+func NewStrictContextMock(ctx context.Context) StrictContextMock
+```
 
 ## session.Event
 
 ```go
 type Event struct {
-    model.LLMResponse                     // Embedded: Content, metadata, etc.
-    ID               string
-    Timestamp        time.Time
-    InvocationID     string
-    Branch           string               // "agent1.agent2.agent3" hierarchy path
-    Author           string               // "user" or agent name
-    Actions          EventActions
+    model.LLMResponse                           // Embedded: Content, UsageMetadata, Partial, ...
+    ID                 string
+    Timestamp          time.Time
+    InvocationID       string
+    Branch             string                   // "agent1.agent2" hierarchy path.
+    IsolationScope     string                   // v2.0.0: restricts which agents see this event.
+    Author             string                   // "user" or agent name.
+    Actions            EventActions
     LongRunningToolIDs []string
+    Routes             []string                 // v2.0.0: workflow routing keys.
+    RequestedInput     *RequestInput            // v2.0.0: workflow HITL pause.
+    Output             any                      // v2.0.0: workflow node output.
+    NodeInfo           *NodeInfo                // v2.0.0
 }
 
-func NewEvent(invocationID string) *Event
+func NewEvent(ctx context.Context, invocationID string) *Event // v2.0.0: ctx first.
 func (e *Event) IsFinalResponse() bool
-```
 
-### session.Events
-
-```go
-type Events interface {
-    All() iter.Seq[*Event]
-    Len() int
-    At(i int) *Event
+type RequestInput struct {
+    InterruptID    string             // Correlation key; empty = UUID.
+    Message        string
+    ResponseSchema *jsonschema.Schema // Reply validation.
+    Payload        any                // JSON-encodable.
 }
 ```
+
+JSON field names are camelCase (`invocationId`, `isolationScope`, `routes`, `requestedInput`, `output`, `nodeInfo`) since v2.2.0. `IsFinalResponse` is false for compaction events.
 
 ### session.EventActions
 
@@ -284,8 +320,9 @@ type EventActions struct {
     ArtifactDelta              map[string]int64
     RequestedToolConfirmations map[string]toolconfirmation.ToolConfirmation
     SkipSummarization          bool
-    TransferToAgent            string    // Target agent name for delegation.
-    Escalate                   bool      // Exit loop / escalate to parent.
+    TransferToAgent            string           // Target agent name for delegation.
+    Escalate                   bool             // Exit a loop / escalate to the parent.
+    Compaction                 *EventCompaction // v2.3.0. Framework-only; cleared if set by user code.
 }
 ```
 
@@ -295,32 +332,32 @@ type EventActions struct {
 type LLMRequest struct {
     Model    string
     Contents []*genai.Content
-    Config   *genai.GenerateContentConfig
-    Tools    map[string]any `json:"-"`
+    Config   *genai.GenerateContentConfig // Function declarations live in Config.Tools.
+    Tools    map[string]any `json:"-"`     // Internal tool registry (filled by PackTool).
 }
 
 type LLMResponse struct {
-    Content             *genai.Content
-    CitationMetadata    *genai.CitationMetadata
-    GroundingMetadata   *genai.GroundingMetadata
-    UsageMetadata       *genai.GenerateContentResponseUsageMetadata
-    CustomMetadata      map[string]any
-    LogprobsResult      *genai.LogprobsResult
-    InputTranscription  *genai.Transcription   // Live sessions (v1.3.0+).
-    OutputTranscription *genai.Transcription   // Live sessions (v1.3.0+).
-    ModelVersion        string
-    Partial             bool             // Streaming: incomplete chunk.
-    TurnComplete        bool             // Streaming: response fully complete.
-    Interrupted         bool
-    SessionResumptionHandle string       // Live sessions (v1.3.0+).
-    ErrorCode           string
-    ErrorMessage        string
-    FinishReason        genai.FinishReason
-    AvgLogprobs         float64
+    Content                 *genai.Content
+    CitationMetadata        *genai.CitationMetadata
+    GroundingMetadata       *genai.GroundingMetadata
+    UsageMetadata           *genai.GenerateContentResponseUsageMetadata
+    CustomMetadata          map[string]any
+    LogprobsResult          *genai.LogprobsResult
+    InputTranscription      *genai.Transcription // Live sessions.
+    OutputTranscription     *genai.Transcription // Live sessions.
+    ModelVersion            string
+    Partial                 bool                 // Streaming: incomplete chunk.
+    TurnComplete            bool                 // Streaming: response complete.
+    Interrupted             bool
+    SessionResumptionHandle string               // Live sessions.
+    ErrorCode               string
+    ErrorMessage            string
+    FinishReason            genai.FinishReason
+    AvgLogprobs             float64
 }
 ```
 
-## session.State
+## session.State and session.Service
 
 ```go
 type State interface {
@@ -333,11 +370,15 @@ type ReadonlyState interface {
     Get(string) (any, error)
     All() iter.Seq2[string, any]
 }
-```
 
-## session.Service
+const (
+    KeyPrefixApp  = "app:"
+    KeyPrefixUser = "user:"
+    KeyPrefixTemp = "temp:"
+)
 
-```go
+var ErrNotFound = errors.New("session not found") // v2.4.0: wrapped by Get and AppendEvent.
+
 type Service interface {
     Create(context.Context, *CreateRequest) (*CreateResponse, error)
     Get(context.Context, *GetRequest) (*GetResponse, error)
@@ -345,32 +386,35 @@ type Service interface {
     Delete(context.Context, *DeleteRequest) error
     AppendEvent(context.Context, Session, *Event) error
 }
-
 func InMemoryService() Service
 
+type CreateRequest struct {
+    AppName, UserID, SessionID string
+    State                      map[string]any
+}
 type GetRequest struct {
-    AppName   string
-    UserID    string
-    SessionID string
-    NumRecentEvents int        // Optional: at most N most recent events.
-    After           time.Time  // Optional: events with timestamp >= After.
+    AppName, UserID, SessionID string
+    NumRecentEvents int       // Optional: at most N most recent events.
+    After           time.Time // Optional: events with timestamp >= After.
 }
 ```
 
-Database-backed: `google.golang.org/adk/session/database`
-Vertex AI-backed: `google.golang.org/adk/session/vertexai`
+Prefixes do not compose (`app:temp:x` is an app key). Custom services must assign IDs to ID-less events, round-trip `EventActions.Compaction`, persist the v2 event fields, wrap `ErrNotFound`, and treat `Delete` of a missing session as a no-op; `session/sessiontestsuite` checks this contract.
 
-## runner.Config and Runner
+Backends: `session/database` (`NewSessionService(dialector, opts...)`, `NewSessionServiceFromDB(*gorm.DB)`, `AutoMigrate(svc)` on every startup) and `session/vertexai` (`NewSessionService(ctx, VertexAIServiceConfig{ProjectID, Location, ReasoningEngine}, opts...)`).
+
+## runner
 
 ```go
 type Config struct {
     AppName           string
-    Agent             agent.Agent
-    SessionService    session.Service
-    ArtifactService   artifact.Service    // Optional.
-    MemoryService     memory.Service      // Optional.
+    Agent             agent.Agent        // Required.
+    SessionService    session.Service    // Required.
+    ArtifactService   artifact.Service   // Optional; needed by artifact tools.
+    MemoryService     memory.Service     // Optional; needed by memory tools.
     PluginConfig      PluginConfig
-    AutoCreateSession bool                // v1.0.0+: Run creates the session if ID not found.
+    AutoCreateSession bool               // Run creates the session on any Get error.
+    Compaction        *compaction.Config // v2.3.0. nil = disabled.
 }
 
 type PluginConfig struct {
@@ -379,49 +423,37 @@ type PluginConfig struct {
 }
 
 func New(cfg Config) (*Runner, error)
+func NewInMemory(appName string, a agent.Agent) (*Runner, error) // v2.1.0: in-memory services + AutoCreateSession.
 
-// Run executes one turn. opts is v1.0.0+; existing call sites compile unchanged.
 func (r *Runner) Run(ctx context.Context, userID, sessionID string, msg *genai.Content,
     cfg agent.RunConfig, opts ...RunOption) iter.Seq2[*session.Event, error]
-
-// RunLive opens a bidirectional (live) session. v1.3.0+.
 func (r *Runner) RunLive(ctx context.Context, userID, sessionID string,
     cfg agent.LiveRunConfig, opts ...RunOption) (agent.LiveSession, iter.Seq2[*session.Event, error], error)
 
-type RunOption func(*runOptions)
-func WithStateDelta(delta map[string]any) RunOption  // Inject state before the run.
+func WithStateDelta(delta map[string]any) RunOption // Inject state before the run.
+func WithYieldUserMessage() RunOption               // v2.0.0: also yield the appended user event (LLM-agent roots).
 ```
 
-## agent.RunConfig
+- A root `llmagent` runs through the workflow node runtime and must be chat mode.
+- An error does not end the stream; `Run` yields `(nil, err)` and may continue.
+- Live runs never compact. Compaction failures wrap `compaction.ErrCompaction` and arrive after the turn's events are persisted.
+
+## agent.RunConfig and Live Sessions
 
 ```go
 type RunConfig struct {
-    StreamingMode             StreamingMode
+    StreamingMode             StreamingMode // StreamingModeNone ("none") or StreamingModeSSE ("sse").
     SaveInputBlobsAsArtifacts bool
 }
 
-type StreamingMode string
-const (
-    StreamingModeNone StreamingMode = "none"
-    StreamingModeSSE  StreamingMode = "sse"
-)
-```
-
-## Live Sessions (v1.3.0+)
-
-Used with `Runner.RunLive` and live-capable Gemini models.
-
-```go
-type LiveSession interface {     // agent.LiveSession
+type LiveSession interface {
     Send(req LiveRequest) error
-    Close() error
+    Close() error // Tears down the flow (v2.3.0); always call it.
 }
 
 type LiveRequest struct {
-    // RealtimeInput can be *genai.Blob, *genai.ActivityStart, or *genai.ActivityEnd.
-    RealtimeInput any
-    // Content is standard text/multimodal user content, or a FunctionResponse reply.
-    Content *genai.Content
+    RealtimeInput any            // *genai.Blob, *genai.ActivityStart, or *genai.ActivityEnd.
+    Content       *genai.Content // Text/multimodal content or a FunctionResponse reply.
 }
 
 type LiveRunConfig struct {
@@ -433,10 +465,40 @@ type LiveRunConfig struct {
     EnableAffectiveDialog    bool
     Proactivity              *genai.ProactivityConfig
     SessionResumption        *genai.SessionResumptionConfig
-    SaveLiveBlob             bool    // Save audio blobs as artifacts.
+    SaveLiveBlob             bool
     MaxLLMCalls              int
 }
 ```
+
+## session/compaction (v2.3.0)
+
+```go
+type Config struct {
+    CompactionInterval int        // Sliding window: summarize every N completed invocations (0 = off).
+    OverlapSize        int        // Re-include N already-compacted invocations (needs CompactionInterval).
+    TokenThreshold     int        // Tail retention: compact mid-invocation when prompt tokens >= this (0 = off).
+    EventRetentionSize int        // Tail retention: raw recent events to keep (required with TokenThreshold).
+    Summarizer         Summarizer // nil = LLMSummarizer over the root agent's model (root must be an LLM agent).
+}
+func (c *Config) Validate() error
+var ErrCompaction error
+
+type Summarizer interface {
+    SummarizeEvents(ctx context.Context, events []*session.Event) (SummarizeResult, error)
+}
+
+type LLMSummarizerConfig struct {
+    Model                 model.LLM     // Required.
+    PromptTemplate        string        // Must contain "{conversation_history}"; "" = built-in.
+    MaxToolContentChars   int           // Per-part cap (default 2000; negative disables).
+    MaxTranscriptChars    int           // Whole-transcript cap (default 200000; exceeding is an error).
+    Timeout               time.Duration
+    GenerateContentConfig *genai.GenerateContentConfig
+}
+func NewLLMSummarizer(cfg LLMSummarizerConfig) (*LLMSummarizer, error)
+```
+
+Covered events stay in the session; prompt assembly replaces them with the summary. Summaries are not yielded to `Run` consumers (find them via `ev.Actions.Compaction != nil`). Keep durable facts in state referenced by `{key}` rather than relying on summaries.
 
 ## functiontool
 
@@ -444,170 +506,204 @@ type LiveRunConfig struct {
 type Config struct {
     Name                        string
     Description                 string
-    InputSchema                 *jsonschema.Schema  // Auto-inferred if nil.
-    OutputSchema                *jsonschema.Schema  // Auto-inferred if nil.
+    InputSchema                 *jsonschema.Schema // nil = inferred from TArgs.
+    OutputSchema                *jsonschema.Schema // nil = inferred from TResults.
     IsLongRunning               bool
-    RequireConfirmation         bool                // Static HITL flag.
-    RequireConfirmationProvider any                 // func(toolInput T) bool
+    RequireConfirmation         bool               // Static HITL flag.
+    RequireConfirmationProvider any                // Must be func(TArgs) bool.
 }
 
-type Func[TArgs, TResults any] func(tool.Context, TArgs) (TResults, error)
+type Func[TArgs, TResults any] func(agent.Context, TArgs) (TResults, error)
 func New[TArgs, TResults any](cfg Config, handler Func[TArgs, TResults]) (tool.Tool, error)
 
-// Streaming tools (live sessions, v1.3.0+): each yielded string is streamed
-// to the model as an intermediate function result.
-type StreamingFunc[TArgs any] func(tool.Context, TArgs) iter.Seq2[string, error]
+type StreamingFunc[TArgs any] func(agent.Context, TArgs) iter.Seq2[string, error]
 func NewStreaming[TArgs any](cfg Config, handler StreamingFunc[TArgs]) (tool.Tool, error)
+
+var ErrInvalidArgument error
 ```
 
-`TArgs` must be a struct or map (or pointer to one); primitives are rejected.
+`TArgs` must be a struct or map (or a pointer to one). Handler panics are recovered into errors. Non-map results are wrapped as `{"result": X}`.
 
-## agenttool.Config
+## agenttool
 
 ```go
 func New(agent agent.Agent, cfg *Config) tool.Tool
 
 type Config struct {
-    SkipSummarization bool    // Skip summarization after sub-agent finishes.
+    SkipSummarization bool // End the parent's turn on the tool result (shown as text since v2.4.0).
 }
 ```
 
-Pass `nil` for `cfg` to use defaults (`SkipSummarization: false`).
+Each call runs the child in a fresh in-memory session seeded with a copy of the parent's state; since v2.5.0 the child shares the parent's artifact store. Output is validated against the child's `OutputSchema` if set, else returned as `{"result": text}`.
 
-## tool.WithConfirmation (experimental)
-
-```go
-type ConfirmationProvider func(toolName string, toolInput any) bool
-
-func WithConfirmation(toolset Toolset, requireConfirmation bool, provider ConfirmationProvider) Toolset
-```
-
-Wraps a `Toolset` so every tool checks HITL confirmation before executing. If `provider` is non-nil, it takes precedence over the static `requireConfirmation` flag. Still marked experimental at v1.4.0 (excluded from the v1.0 API stability guarantee). See `integrations.md` for usage examples.
-
-## tool.Predicate and FilterToolset
+## Tool Helpers
 
 ```go
+var ErrConfirmationRequired error
+var ErrConfirmationRejected error
+
 type Predicate func(ctx agent.ReadonlyContext, tool Tool) bool
-
-// Create a predicate from a string slice of allowed tool names.
-func StringPredicate(allowedTools []string) Predicate
-
-// Wrap a Toolset to only expose tools matching the predicate.
+func AllowedToolsPredicate(allowedTools []string) Predicate
+func StringPredicate(allowedTools []string) Predicate // Deprecated.
 func FilterToolset(toolset Toolset, predicate Predicate) Toolset
+
+// Experimental.
+type ConfirmationProvider func(toolName string, toolInput any) bool
+func WithConfirmation(toolset Toolset, requireConfirmation bool, provider ConfirmationProvider) Toolset
+
+// tool/toolconfirmation
+const FunctionCallName = "adk_request_confirmation"
+type ToolConfirmation struct {
+    Hint      string `json:"hint"`
+    Confirmed bool   `json:"confirmed"`
+    Payload   any    `json:"payload"`
+}
+func OriginalCallFrom(fc *genai.FunctionCall) (*genai.FunctionCall, error)
 ```
+
+Framework-injected tools to recognize in traces: `transfer_to_agent`, `set_model_response`, `finish_task` (task mode), one tool per single_turn/task sub-agent (named after it), `task_completed` (`sequentialagent` live runs only), `adk_request_confirmation`, and `adk_request_input` (workflow HITL).
 
 ## genai.GenerateContentConfig (Key Fields)
 
 ```go
 type GenerateContentConfig struct {
-    SystemInstruction  *Content          // System-level instructions.
-    Temperature        *float32          // 0.0 = deterministic.
-    TopP               *float32          // Nucleus sampling.
-    TopK               *float32          // Top-K sampling.
-    MaxOutputTokens    int32
-    StopSequences      []string
-    ResponseMIMEType   string            // "text/plain" or "application/json".
-    ResponseSchema     *Schema           // Structured output schema.
-    SafetySettings     []*SafetySetting
-    ThinkingConfig     *ThinkingConfig
-    Seed               *int32            // Reproducibility.
-    CandidateCount     int32
-    PresencePenalty    *float32
-    FrequencyPenalty   *float32
+    SystemInstruction *Content
+    Temperature       *float32
+    TopP              *float32
+    TopK              *float32
+    MaxOutputTokens   int32
+    StopSequences     []string
+    ResponseMIMEType  string   // "text/plain" or "application/json".
+    ResponseSchema    *Schema
+    SafetySettings    []*SafetySetting
+    ThinkingConfig    *ThinkingConfig
+    Seed              *int32
+    CandidateCount    int32
+    PresencePenalty   *float32
+    FrequencyPenalty  *float32
 }
 ```
 
-Use `genai.Ptr[float32](0.7)` to set pointer fields like `Temperature`.
-
-When using ADK, prefer `llmagent.Config.Instruction` over `GenerateContentConfig.SystemInstruction` — ADK manages system instructions through the `Instruction` field.
+Use `genai.Ptr[float32](0.7)` for pointer fields. Prefer `llmagent.Config.Instruction` over `SystemInstruction`.
 
 ## Workflow Agent Configs
 
-### sequentialagent.Config
-
 ```go
+// sequentialagent, parallelagent
 type Config struct {
-    AgentConfig agent.Config    // Name + SubAgents required.
+    AgentConfig agent.Config // Name + SubAgents required; a custom Run is rejected.
 }
-```
 
-### parallelagent.Config
-
-```go
+// loopagent
 type Config struct {
-    AgentConfig agent.Config    // Name + SubAgents required.
+    AgentConfig   agent.Config
+    MaxIterations uint // 0 = run until a sub-agent escalates.
 }
-```
 
-### loopagent.Config
-
-```go
+// agent/workflowagent (graph workflows)
 type Config struct {
-    MaxIterations uint          // 0 = indefinite (until Escalate).
-    AgentConfig   agent.Config  // Name + SubAgents required.
+    Name                 string
+    Description          string
+    SubAgents            []agent.Agent // Agents wrapped in AgentNodes.
+    BeforeAgentCallbacks []agent.BeforeAgentCallback
+    AfterAgentCallbacks  []agent.AfterAgentCallback
+    Edges                []workflow.Edge
 }
 ```
 
 ## remoteagent/v2 A2AConfig
 
-The canonical remote-agent package is `agent/remoteagent/v2` (a2a-go v2 types). The v1 `agent/remoteagent` package (with `AgentCardSource`/`CardResolveOptions`/`ClientFactory` fields) is deprecated.
-
 ```go
-// import remoteagent "google.golang.org/adk/agent/remoteagent/v2"
+// import remoteagent "google.golang.org/adk/v2/agent/remoteagent/v2"
 
 func NewA2A(cfg A2AConfig) (agent.Agent, error)
-
-// Resolves a card from an http(s) URL or a local file path.
-func NewAgentCardProvider(source string, opts ...agentcard.ResolveOption) AgentCardProvider
+func NewAgentCardProvider(source string, opts ...agentcard.ResolveOption) AgentCardProvider // http(s) URL or file path.
 type AgentCardProvider func(ctx context.Context) (*a2a.AgentCard, error)
+func NewA2AClientProvider(factory *a2aclient.Factory) A2AClientProvider
 
 type A2AConfig struct {
     Name        string
     Description string
 
-    AgentCard         *a2a.AgentCard     // Static card. Either this OR:
-    AgentCardProvider AgentCardProvider  // Resolved on each invocation.
+    AgentCard         *a2a.AgentCard    // Static card, OR:
+    AgentCardProvider AgentCardProvider // Resolved per invocation.
 
     BeforeAgentCallbacks   []agent.BeforeAgentCallback
-    BeforeRequestCallbacks []BeforeA2ARequestCallback
-    Converter              A2AEventConverter         // Default: adka2a.ToSessionEvent.
+    BeforeRequestCallbacks []BeforeA2ARequestCallback // func(agent.Context, *a2a.SendMessageRequest) (*session.Event, error)
+    Converter              A2AEventConverter
     AfterRequestCallbacks  []AfterA2ARequestCallback
     AfterAgentCallbacks    []agent.AfterAgentCallback
 
-    A2APartConverter   adka2a.A2APartConverter    // Custom A2A→GenAI part conversion.
-    GenAIPartConverter adka2a.GenAIPartConverter  // Custom GenAI→A2A part conversion.
+    AllowTransferToAgent bool // v2.3.0. Default false: a peer's transfer request is redacted.
 
-    ClientProvider    A2AClientProvider          // Custom message-sending implementation.
+    A2APartConverter   adka2a.A2APartConverter
+    GenAIPartConverter adka2a.GenAIPartConverter
+
+    ClientProvider    A2AClientProvider       // Custom client (e.g. authenticated HTTP).
     MessageSendConfig *a2a.SendMessageConfig
 
-    // Called if Run exits before a terminal event from the remote server.
-    // Default behavior: cancel RPC with a 5s timeout.
-    RemoteTaskCleanupCallback A2ARemoteTaskCleanupCallback
+    RemoteTaskCleanupCallback A2ARemoteTaskCleanupCallback // Default: cancel with a 5s timeout.
 }
+
+var ErrUnsupportedCardSource error  // v2.3.0: source is neither http(s) nor a path.
+var ErrUntrustedCardInterface error // v2.4.0: fetched card advertises another origin, or non-loopback http.
 ```
 
-Server side: `server/adka2a/v2` exposes agents over A2A (the launcher's `a2a` mode uses it); `server/adkrest` embeds the REST API in existing services.
-
-## plugin.Config
+## plugin
 
 ```go
 type Config struct {
-    Name                    string
-    OnUserMessageCallback   OnUserMessageCallback
-    OnEventCallback         OnEventCallback
-    BeforeRunCallback       BeforeRunCallback
-    AfterRunCallback        AfterRunCallback
-    BeforeAgentCallback     agent.BeforeAgentCallback
-    AfterAgentCallback      agent.AfterAgentCallback
-    BeforeModelCallback     llmagent.BeforeModelCallback
-    AfterModelCallback      llmagent.AfterModelCallback
-    OnModelErrorCallback    llmagent.OnModelErrorCallback
-    BeforeToolCallback      llmagent.BeforeToolCallback
-    AfterToolCallback       llmagent.AfterToolCallback
-    OnToolErrorCallback     llmagent.OnToolErrorCallback
-    CloseFunc               func() error
+    Name                  string
+    OnUserMessageCallback OnUserMessageCallback
+    OnEventCallback       OnEventCallback
+    BeforeRunCallback     BeforeRunCallback
+    AfterRunCallback      AfterRunCallback
+    BeforeAgentCallback   agent.BeforeAgentCallback
+    AfterAgentCallback    agent.AfterAgentCallback
+    BeforeModelCallback   llmagent.BeforeModelCallback
+    AfterModelCallback    llmagent.AfterModelCallback
+    OnModelErrorCallback  llmagent.OnModelErrorCallback
+    BeforeToolCallback    llmagent.BeforeToolCallback
+    AfterToolCallback     llmagent.AfterToolCallback
+    OnToolErrorCallback   llmagent.OnToolErrorCallback
+    CloseFunc             func() error
 }
+func New(cfg Config) (*Plugin, error)
+
+type OnUserMessageCallback func(agent.InvocationContext, *genai.Content) (*genai.Content, error)
+type BeforeRunCallback func(agent.InvocationContext) (*genai.Content, error)
+type AfterRunCallback func(agent.InvocationContext)
+type OnEventCallback func(agent.InvocationContext, *session.Event) (*session.Event, error)
 ```
+
+Plugin callbacks run before the agent's own callbacks of the same kind. Plugins cannot plant or alter `Actions.Compaction`.
+
+### Built-in Plugins
+
+```go
+// plugin/retryandreflect
+func New(opts ...PluginOption) (*plugin.Plugin, error)
+func MustNew(opts ...PluginOption) *plugin.Plugin
+func WithMaxRetries(maxRetries int) PluginOption         // Default 3.
+func WithErrorIfRetryExceeded(b bool) PluginOption       // Default false: inject "stop using this tool" guidance.
+func WithTrackingScope(scope TrackingScope) PluginOption // Invocation (default) or Global.
+
+// plugin/functioncallmodifier
+func NewPlugin(cfg FunctionCallModifierConfig) (*plugin.Plugin, error)
+func MustNewPlugin(cfg FunctionCallModifierConfig) *plugin.Plugin
+type FunctionCallModifierConfig struct {
+    Predicate           func(toolName string) bool
+    Args                map[string]*genai.Schema         // Extra args injected into tool schemas.
+    OverrideDescription func(original string) string
+}
+// Injected args are stripped from the call and stored in state under "{functionCallID}/{argName}".
+
+// plugin/loggingplugin
+func New(name string) (*plugin.Plugin, error) // "" = "logging_plugin".
+func MustNew(name string) *plugin.Plugin
+```
+
+The BigQuery agent analytics plugin lives in the separate module `google.golang.org/adk/plugin/agentanalytics`.
 
 ## artifact.Service
 
@@ -618,39 +714,41 @@ type Service interface {
     Delete(ctx context.Context, req *DeleteRequest) error
     List(ctx context.Context, req *ListRequest) (*ListResponse, error)
     Versions(ctx context.Context, req *VersionsRequest) (*VersionsResponse, error)
-    GetArtifactVersion(ctx context.Context, req *GetArtifactVersionRequest) (*GetArtifactVersionResponse, error)  // v1.1.0+
+    GetArtifactVersion(ctx context.Context, req *GetArtifactVersionRequest) (*GetArtifactVersionResponse, error)
+}
+func InMemoryService() Service
+
+type SaveRequest struct {
+    AppName, UserID, SessionID, FileName string
+    Part           *genai.Part
+    CustomMetadata map[string]any // v2.5.0: values persisted as strings.
+    Version        int64
 }
 
-func InMemoryService() Service
+type ArtifactVersion struct {
+    Version        int64
+    CanonicalURI   string         // Stable identity (gs://bucket/object for GCS); not a download URL.
+    CustomMetadata map[string]any // Always non-nil.
+    CreateTime     time.Time      // Was float64 in v1.
+    MimeType       string
+}
 ```
 
-GCS-backed: `google.golang.org/adk/artifact/gcsartifact`
+Filenames prefixed `user:` are user-scoped. GCS backend: `artifact/gcsartifact.NewService(ctx, bucketName, opts...)`.
 
 ## memory.Service
-
-Method names changed at v1.0.0 (`AddSession` → `AddSessionToMemory`, `Search` → `SearchMemory`); request/response type names did not change.
 
 ```go
 type Service interface {
     AddSessionToMemory(ctx context.Context, s session.Session) error
     SearchMemory(ctx context.Context, req *SearchRequest) (*SearchResponse, error)
 }
-
 func InMemoryService() Service
+
+type SearchRequest struct{ Query, UserID, AppName string }
 ```
 
-Vertex AI Memory Bank backend (v1.3.0+): `google.golang.org/adk/memory/vertexai`
-
-```go
-// import memvertexai "google.golang.org/adk/memory/vertexai"
-func NewService(ctx context.Context, config *ServiceConfig) (memory.Service, error)
-
-type ServiceConfig struct {
-    vertexaiutil.AgentEngineData             // Embedded: identifies the Agent Engine instance.
-    StateKeySessionLastUpdateTime string     // "" = use whole session for memory generation.
-    WaitForCompletion             bool
-}
-```
+Vertex AI Memory Bank: `memory/vertexai.NewService(ctx, *ServiceConfig)`. `ServiceConfig` embeds `util/vertexai.AgentEngineData{ProjectID, Location, ReasoningEngine}` and adds `StateKeySessionLastUpdateTime string` and `WaitForCompletion bool`.
 
 ## agent.Loader
 
@@ -660,12 +758,9 @@ type Loader interface {
     LoadAgent(name string) (Agent, error)
     RootAgent() Agent
 }
-
 func NewSingleLoader(a Agent) Loader
-func NewMultiLoader(root Agent, agents ...Agent) (Loader, error)
+func NewMultiLoader(root Agent, agents ...Agent) (Loader, error) // Error on duplicate names.
 ```
-
-`NewSingleLoader` provides one root agent. `NewMultiLoader` registers multiple agents with one designated as root; returns error on duplicate names. Used with `launcher.Config.AgentLoader`.
 
 ## launcher.Config
 
@@ -676,12 +771,16 @@ type Config struct {
     MemoryService    memory.Service
     AgentLoader      agent.Loader
     A2AOptions       []a2asrv.RequestHandlerOption
-    PluginConfig     runner.PluginConfig    // Plugins in launcher mode.
-    TelemetryOptions []telemetry.Option     // Telemetry in launcher mode.
+    PluginConfig     runner.PluginConfig
+    TelemetryOptions []telemetry.Option
+    Authenticator    authn.Authenticator // v2.4.0, REST API only.
+    Authorizer       authz.Authorizer    // v2.4.0
+    Compaction       *compaction.Config  // v2.3.0
+    BindHost         string              // v2.5.0, set by the web launcher.
+    MaxPayloadSize   int64               // v2.5.0, <= 0 = 10 MiB.
 }
+func (c *Config) Validate() error
 ```
-
-Launchers: `full.NewLauncher()` (console + web UI + API + A2A, dev), `prod.NewLauncher()` (REST API + A2A only), plus `cmd/launcher/console`, `cmd/launcher/web`, `cmd/launcher/universal` (compose custom sets via `launcher.SubLauncher`), and `cmd/launcher/agentengine` for Vertex AI Agent Engine. Pub/Sub and Eventarc trigger sublaunchers: `cmd/launcher/web/triggers/{pubsub,eventarc}`.
 
 ## telemetry
 
@@ -692,131 +791,63 @@ type Providers struct {
     TracerProvider *sdktrace.TracerProvider
     LoggerProvider *sdklog.LoggerProvider
 }
-
 func (t *Providers) SetGlobalOtelProviders()
 func (t *Providers) Shutdown(ctx context.Context) error
 ```
 
-### Telemetry Options
-
 | Option | Purpose |
 |---|---|
-| `WithOtelToCloud(bool)` | Enable/disable export to GCP `telemetry.googleapis.com`. |
+| `WithOtelToCloud(bool)` | Export to Google Cloud (`telemetry.googleapis.com`). |
 | `WithResource(*resource.Resource)` | Custom OTel resource (merged with defaults). |
 | `WithGoogleCredentials(*google.Credentials)` | Override application default credentials. |
-| `WithGcpResourceProject(string)` | Set `gcp.project_id` resource attribute. |
-| `WithGcpQuotaProject(string)` | Set quota project for telemetry export. |
-| `WithSpanProcessors(...sdktrace.SpanProcessor)` | Register additional span processors. |
-| `WithLogRecordProcessors(...sdklog.Processor)` | Register additional log processors. |
-| `WithTracerProvider(*sdktrace.TracerProvider)` | Override the default TracerProvider. |
-| `WithLoggerProvider(*sdklog.LoggerProvider)` | Override the default LoggerProvider. |
-| `WithGenAICaptureMessageContent(bool)` | Log message content (default from `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT` env). |
+| `WithGcpResourceProject(string)` | Set the `gcp.project_id` resource attribute. |
+| `WithGcpQuotaProject(string)` | Quota project for export. |
+| `WithSpanProcessors(...sdktrace.SpanProcessor)` | Additional span processors. |
+| `WithLogRecordProcessors(...sdklog.Processor)` | Additional log processors. |
+| `WithTracerProvider(*sdktrace.TracerProvider)` | Override the TracerProvider. |
+| `WithLoggerProvider(*sdklog.LoggerProvider)` | Override the LoggerProvider. |
 
-## Plugin Callback Types
+Message content capture is controlled only by `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT`:
 
-```go
-type OnUserMessageCallback func(agent.InvocationContext, *genai.Content) (*genai.Content, error)
-type BeforeRunCallback func(agent.InvocationContext) (*genai.Content, error)
-type AfterRunCallback func(agent.InvocationContext)
-type OnEventCallback func(agent.InvocationContext, *session.Event) (*session.Event, error)
-```
+| Value | Log records | `generate_content` span attributes (`gen_ai.input.messages`, ...) |
+|---|---|---|
+| unset | no | no |
+| `true` / `1` | yes | no |
+| `EVENT_ONLY` | yes | no |
+| `SPAN_ONLY` | no | yes |
+| `SPAN_AND_EVENT` | yes | yes |
 
-These are plugin-specific callbacks defined in `google.golang.org/adk/plugin`. Model/tool/agent callbacks in `plugin.Config` reuse the types from `llmagent` and `agent` packages.
+Span attributes over 60 KiB are omitted entirely. OTLP exporters read the standard `OTEL_EXPORTER_OTLP_*` endpoint variables. Code passing `sdklog` types must use `go.opentelemetry.io/otel/sdk/log` v0.22.x.
 
-## Built-in Plugin Configs
-
-### retryandreflect
+## Other Packages
 
 ```go
-func New(opts ...PluginOption) (*plugin.Plugin, error)
-func MustNew(opts ...PluginOption) *plugin.Plugin
-
-type TrackingScope string
-const (
-    Invocation TrackingScope = "invocation"    // Per-invocation failure tracking (default).
-    Global     TrackingScope = "global"        // Cross-invocation failure tracking.
-)
-
-func WithMaxRetries(maxRetries int) PluginOption         // Default: 3.
-func WithErrorIfRetryExceeded(b bool) PluginOption       // Default: false (injects guidance instead).
-func WithTrackingScope(scope TrackingScope) PluginOption  // Default: Invocation.
-```
-
-When `ErrorIfRetryExceeded` is `false` (default), exceeded retries inject an instruction telling the LLM to stop using the failing tool rather than returning the raw error.
-
-### functioncallmodifier
-
-```go
-func NewPlugin(cfg FunctionCallModifierConfig) (*plugin.Plugin, error)
-func MustNewPlugin(cfg FunctionCallModifierConfig) *plugin.Plugin
-
-type FunctionCallModifierConfig struct {
-    Predicate           func(toolName string) bool       // Which tools to modify.
-    Args                map[string]*genai.Schema          // Extra args to inject into tool schema.
-    OverrideDescription func(original string) string      // Rewrite tool description.
-}
-```
-
-Injected args are stripped from the LLM's function call and stored in session state under `"{functionCallID}/{argName}"`.
-
-### loggingplugin
-
-```go
-func New(name string) (*plugin.Plugin, error)
-func MustNew(name string) *plugin.Plugin
-```
-
-Pass `""` for name to default to `"logging_plugin"`. Logs to console with ANSI grey coloring.
-
-## tool/exampletool (v1.0.0+)
-
-Injects few-shot examples into the LLM request as system-instruction text (a request processor, not an LLM-invoked tool).
-
-```go
+// tool/exampletool: few-shot examples injected as system-instruction text (not an LLM-invoked tool).
 type Example struct {
     Input  *genai.Content   `json:"input"`
     Output []*genai.Content `json:"output"`
 }
+type ExampleToolConfig struct{ Examples []*Example }
+func New(config ExampleToolConfig) (*exampleTool, error) // Use as tool.Tool.
 
-type ExampleToolConfig struct {
-    Examples []*Example
-}
-
-func New(config ExampleToolConfig) (tool.Tool, error)  // Concrete unexported type; use as tool.Tool.
-```
-
-## tool/skilltoolset (v1.2.0+)
-
-Agent Skills with progressive disclosure: the toolset injects skill frontmatter into the system instruction and exposes `load_skill` / resource-loading tools so the LLM pulls full skill content on demand.
-
-```go
-// import "google.golang.org/adk/tool/skilltoolset"
-//        "google.golang.org/adk/tool/skilltoolset/skill"
-
+// tool/skilltoolset: Agent Skills with progressive disclosure (load_skill takes a "name" param).
 type Config struct {
-    Source            skill.Source  // Where skills come from (e.g., filesystem source).
+    Source            skill.Source // e.g. a filesystem source from the skill subpackage.
     Name              string
     SystemInstruction string
 }
+func New(ctx context.Context, cfg Config) (*SkillToolset, error) // Implements tool.Toolset.
 
-func New(ctx context.Context, cfg Config) (*SkillToolset, error)  // Implements tool.Toolset.
-```
+// model/apigee: the model name must start with "apigee/".
+func NewModel(ctx context.Context, modelName string, opts ...Option) (*apigeeModel, error) // Use as model.LLM.
+// Options: WithProxyURL(string), WithCustomHeaders(http.Header), WithHTTPClient(*http.Client) (testing only).
 
-The `skill` subpackage provides `Frontmatter`, `Parse`, `ParseBytes`, `Validate`, `Build`, the `Source` interface, a filesystem source, and preload/merge source proxies.
-
-## model/apigee (v1.0.0+)
-
-Routes Gemini calls through an Apigee proxy:
-
-```go
-func NewModel(ctx context.Context, modelName string, opts ...Option) (model.LLM, error)  // Concrete unexported type; use as model.LLM.
-// Options: WithProxyURL(string), WithCustomHeaders(http.Header), WithHTTPClient(*http.Client)
-```
-
-## util/instructionutil
-
-```go
-// Performs {key} / {artifact.key} / {key?} substitution against session state.
-// Use inside an InstructionProvider (providers do not auto-substitute).
+// util/instructionutil: {key} / {artifact.key} / {key?} substitution inside an InstructionProvider.
 func InjectSessionState(ctx agent.ReadonlyContext, template string) (string, error)
+
+// platform: context-carried seams for deterministic tests and custom executors.
+func WithTimeProvider(ctx context.Context, provider TimeProvider) context.Context
+func WithUUIDProvider(ctx context.Context, provider UUIDProvider) context.Context
+func WithTaskRunner(ctx context.Context, runner TaskRunner) context.Context // v2.1.0: parallel tool-call fan-out.
+type TaskRunner func(ctx context.Context, tasks []func(context.Context)) // Must block until all tasks finish.
 ```

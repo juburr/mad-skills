@@ -249,7 +249,7 @@ type Config struct {
 
 Behavior notes:
 
-- At v2.5.0, a config with neither `Transport` nor `Endpoint` is **not** rejected by `New`; it panics later during tool discovery. Validate your config.
+- At v2.5.0, a config with neither `Transport` nor `Endpoint` is **not** rejected by `New`; it fails later during tool discovery with a nil-pointer panic (under the runner, a run error such as `node "root" panicked: ...`). Validate your config.
 - `Auth` with a non-HTTP transport fails at construction. Do not combine `Auth` with the transport's own `OAuthHandler`.
 - Sessions are created lazily on the first LLM request and reconnect automatically on closed connections or missing sessions. Tool discovery paginates `ListTools`.
 - Results: `StructuredContent` is returned as `{"output": ...}`; otherwise text is returned as `{"output": "<text>"}`. Since v2.4.0, empty text is valid, and non-text content (images, audio, resource links) is rendered as bracketed labels instead of being dropped (binary payloads are not forwarded to the model).
@@ -278,7 +278,7 @@ safe := tool.WithConfirmation(myToolset, false, func(toolName string, toolInput 
 
 ## Outbound Auth (`auth`, `auth/gcp`)
 
-Credentials for outbound calls (MCP servers, A2A peers, any HTTP client). Core package since v2.1.0; credential caching and `auth/gcp` since v2.3.0.
+Credentials for outbound calls (MCP servers, A2A peers, any HTTP client). Core package since v2.1.0; `auth/gcp` REST client since v2.3.0; credential caching (`CredentialStore`) and the per-user `gcp.NewProvider` since v2.5.0.
 
 ```go
 type Credential interface{ Apply(h http.Header) error }

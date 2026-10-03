@@ -15,7 +15,7 @@ Multi-agent orchestration with workflow agents, LLM-driven delegation (including
 | Deterministic steps mixed with LLM steps, typed hand-offs, per-step retry/timeout, HITL pause/resume, data-dependent loops with checkpointing | Graph workflow (`workflow` + `workflowagent`) |
 | Cross-service agents | Remote A2A agents in any of the above (Pattern 8) |
 
-Collaboration modes are for **LLM-decided** delegation; graph workflows are for **code-decided** flow. Sequential/parallel/loop agents are not deprecated in Go and remain the simplest option (and the only one that composes `RunLive` pipelines).
+Collaboration modes are for **LLM-decided** delegation; graph workflows are for **code-decided** flow. Sequential/parallel/loop agents are not deprecated in Go and remain the simplest option; `sequentialagent` is the only workflow agent that supports `RunLive` pipelines.
 
 ## Pattern 1: Sequential Pipeline
 
@@ -280,7 +280,7 @@ travelPlanner, _ := llmagent.New(llmagent.Config{ // Root: leave Mode unset (cha
 - An agent with no declared `Mode` is resolved per placement: chat as a root or sub-agent, single_turn as a graph node. Declare `Mode` explicitly when one agent instance is reused in several places.
 - `task_completed` is unrelated: it is a tool `sequentialagent` injects only during `RunLive`.
 
-**Single-turn vs. AgentTool:** single_turn sub-agents keep the specialist's tool calls in the parent session's history, and the repo recommends them over the older `agenttool` pattern. Use `agenttool.New(a, &agenttool.Config{SkipSummarization: ...})` when the child should run in a **separate in-memory session** (its events never enter the parent session). Since v2.5.0, `agenttool` children share the parent's artifact store.
+**Single-turn vs. AgentTool:** single_turn sub-agents keep the specialist's tool calls in the parent session's history, and the repo recommends them over the older `agenttool` pattern. Use `agenttool.New(a, &agenttool.Config{SkipSummarization: ...})` when the child should run in a **separate in-memory session** (its events never enter the parent session). The child gets a copy of the parent's state, but its state changes are **not** written back; return data through the tool result. Since v2.5.0, `agenttool` children share the parent's artifact store.
 
 ## Pattern 6: Custom Agent with Planning Loop
 

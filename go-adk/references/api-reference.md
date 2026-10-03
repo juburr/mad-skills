@@ -88,7 +88,7 @@ func New(cfg Config) (Agent, error) // Errors if a sub-agent appears twice.
 ```go
 type Config struct {
     // Identity
-    Name        string        // Required. Unique in the agent tree. Cannot be "user".
+    Name        string        // Required. Unique in the agent tree. Do not use "user" (reserved; not validated).
     Description string        // One line; used by parents to decide delegation.
     SubAgents   []agent.Agent
 
@@ -103,7 +103,8 @@ type Config struct {
     OnModelErrorCallbacks []OnModelErrorCallback
 
     // Instructions. {key} from state, {key?} optional, {artifact.name} artifact text.
-    // Keys must match ^[a-zA-Z_][a-zA-Z0-9_]*$ (others are left literal). A missing non-optional key is an error.
+    // Keys must match ^[a-zA-Z_][a-zA-Z0-9_]*$, optionally with an app:, user:, or temp: prefix (others are
+    // left literal). A missing non-optional key is an error.
     Instruction               string
     InstructionProvider       InstructionProvider // Replaces Instruction; NO {key} substitution.
     GlobalInstruction         string              // Only the root agent's global instruction takes effect.
@@ -179,7 +180,7 @@ type AfterToolCallback func(ctx agent.Context, tool tool.Tool, args, result map[
 type OnToolErrorCallback func(ctx agent.Context, tool tool.Tool, args map[string]any, err error) (map[string]any, error)
 ```
 
-In each callback list, the first callback returning a non-nil value (or error) stops the chain. A `BeforeAgentCallback` returning an error surfaces the error but does not stop the agent; only non-nil content short-circuits it.
+In each callback list, the first callback returning a non-nil value (or error) stops the chain. Error handling in `BeforeAgentCallback` depends on placement: for a root `llmagent` run by the runner an error skips the agent, while sub-agents of workflow agents and custom `agent.New` agents yield the error and still run. Return non-nil content to short-circuit reliably.
 
 ## Context Interfaces
 
@@ -534,7 +535,7 @@ type Config struct {
 }
 ```
 
-Each call runs the child in a fresh in-memory session seeded with a copy of the parent's state; since v2.5.0 the child shares the parent's artifact store. Output is validated against the child's `OutputSchema` if set, else returned as `{"result": text}`.
+Each call runs the child in a fresh in-memory session seeded with a copy of the parent's state, with a fresh in-memory memory service. **State changes made by the child are not written back to the parent**; return data through the tool result. Since v2.5.0 the child shares the parent's artifact store. Output is validated against the child's `OutputSchema` if set, else returned as `{"result": text}`.
 
 ## Tool Helpers
 

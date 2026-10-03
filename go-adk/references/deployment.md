@@ -55,7 +55,7 @@ The web launcher fills nil session, artifact, and memory services with in-memory
 
 ## Command-Line Syntax
 
-`full` and `universal` pick a mode from the first argument (`console` when absent). `web` parses its own flags, then each sublauncher keyword consumes the flags that follow it, up to the next keyword. **A flag must follow its own keyword**: `web api -port 8001` fails because `-port` belongs to `web`. Each keyword may appear once.
+Launchers built on `universal` pick a sublauncher from the first argument and default to their first one (`console` for `full`, `web` for `prod`). `web` parses its own flags, then each sublauncher keyword consumes the flags that follow it, up to the next keyword. **A flag must follow its own keyword**: `web api -port 8001` fails because `-port` belongs to `web`. Each keyword may appear once.
 
 | Keyword | Flags (default) |
 |---|---|
@@ -82,6 +82,8 @@ go run . web -port 8001 api a2a -a2a_agent_url http://localhost:8001
     api -webui_address https://agent.example.com \
     a2a -a2a_agent_url https://agent.example.com
 ```
+
+**A2A exposes only the root agent:** the `a2a` sublauncher publishes `AgentLoader.RootAgent()`; other agents in a multi-agent loader are not reachable over A2A.
 
 **A2A URL rule:** `-a2a_agent_url` must share the origin (scheme, host, port) of the URL clients fetch the card from, and must be `https` unless the host is loopback. Otherwise `remoteagent/v2` clients reject the card with `ErrUntrustedCardInterface`. Keep `-port` and `-a2a_agent_url` in sync.
 

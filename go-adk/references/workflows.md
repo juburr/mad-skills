@@ -70,7 +70,7 @@ Register AgentNode-wrapped agents in `SubAgents`; otherwise the runner logs "Eve
 ### Function Node Semantics
 
 - **Input conversion:** a direct type assertion to `IN` is tried first, then a JSON round-trip (a `map[string]any` becomes your struct). A nil input becomes the zero value of `IN`.
-- **Output:** a `*genai.Content` goes to `Event.Content`; a returned `*session.Event` is yielded as-is (lets a plain node set `Routes`/`Output`); **anything else goes to `Event.Output` with no `Content`**.
+- **Output:** a `*genai.Content` goes to `Event.Content`; a returned `*session.Event` is yielded as-is (lets a plain node set `Routes`/`Output`); **anything else goes to `Event.Output` with no `Content`**. Exception: a `string` returned from an emitting node sets both `Output` and `Content`.
 - **No schema inference:** `NewFunctionNode` never infers schemas from `IN`/`OUT`. A conversion failure without a schema is an ordinary error and is retried under `DefaultRetryConfig` (up to ~15s of backoff before it surfaces).
 - **From state:** fields load from session state by field name or `state:"key"` tag; a field tagged `state:"node_input"` (or named `NodeInput`) receives the predecessor's output. A missing key is a node error.
 
@@ -358,19 +358,21 @@ for ev, err := range r.Run(ctx, userID, sessionID, resume, agent.RunConfig{}) {
 }
 ```
 
-`session.RequestInput` fields: `InterruptID` (correlation key; empty = UUID), `Message`, `ResponseSchema *jsonschema.Schema` (a mismatching reply yields `ErrInvalidResumeResponse` and the node keeps waiting), and `Payload any` (JSON-encodable). An answer that matches no waiting node yields `ErrNothingToResume`; a duplicate answer is a no-op.
+`session.RequestInput` fields: `InterruptID` (correlation key; empty = UUID), `Message`, `ResponseSchema *jsonschema.Schema` (a mismatching reply yields `ErrInvalidResumeResponse` and the node keeps waiting), and `Payload any` (JSON-encodable). Through the runner, a duplicate answer (an ID that was already answered) returns `ErrNothingToResume`. An answer with an unknown ID, or plain text sent while the graph is paused, does **not** resume: it starts a fresh run from `Start` in a new invocation.
 
 HITL rules:
 
 - Use a unique `InterruptID` per run (UUID or `name + "-" + ctx.InvocationID()`). The dev web UI skips prompts for IDs it already answered in the session.
 - A handoff resume ignores concrete routes from the asker (successors are evaluated with no event). Only unconditional and `Default` edges fire. Route in a node after the asker, or use re-entry mode and emit `Routes` on the re-run.
-- **Tool confirmation inside an AgentNode is not resumed by `workflowagent`** at v2.5.0: the confirmed tool never runs. Inside graphs, ask for approval with `RequestInput` instead of `RequireConfirmation`.
+- **Tool confirmation inside an AgentNode is not resumed by `workflowagent`** at v2.5.0: the confirmed tool never runs. Inside graphs, ask for approval with `NewRequestInputEvent` / `ResumeOrRequestInput` instead of `RequireConfirmation`.
 - **A dynamic node re-runs children completed before the first pause** once, on the first resume (later resumes hit the cache). Keep pre-pause children idempotent.
+- **Paused children of a dynamic node are not cached.** A handoff-style child (emits a request and returns `ErrNodeInterrupted`) called via `RunNode` asks again on every resume. Make such children use `ResumeOrRequestInput`, or have the orchestrator check `ctx.ResumedInput(interruptID)` before calling `RunNode`.
+- **Reply decoding:** a string in `{"response": "..."}` is JSON-decoded when it parses, so `"42"` arrives as `float64(42)` and a `string`-typed successor fails to convert it. Send `{"payload": v}` to pass a value verbatim, or type the successor's input as `any`.
 - Graph run state is rebuilt from session events. A custom `session.Service` must persist `Output`, `NodeInfo`, `RequestedInput`, `Routes`, `IsolationScope`, and `LongRunningToolIDs`. Changing the graph between pause and resume corrupts the resume.
 
 ## Reading Workflow Results
 
-Function-node results are in `event.Output` with **no `Content`**; a loop that only prints `event.Content` text shows nothing for them. Every node's output event is yielded (intermediate nodes included, authored by the workflow's name), so the last one is the terminal result. LLM agent nodes produce `Content` (the runner strips the duplicate `Output` from the yielded copy).
+`NewFunctionNode` results are in `event.Output` with **no `Content`**; a loop that only prints `event.Content` text shows nothing for them. Every node's output event is yielded (intermediate nodes included, authored by the workflow's name), so the last one is the terminal result. LLM agent nodes produce `Content` (the runner strips the duplicate `Output` from the yielded copy).
 
 ```go
 for ev, err := range r.Run(ctx, userID, sessionID, msg, agent.RunConfig{}) {
@@ -396,7 +398,8 @@ for ev, err := range r.Run(ctx, userID, sessionID, msg, agent.RunConfig{}) {
 |---|---|
 | `ErrDuplicateNodeName`, `ErrNoStartNode`, `ErrNodePointsToStart`, `ErrDuplicateEdge`, `ErrMultipleDefaultRoutes`, `ErrNodesNotReachable`, `ErrUnconditionalCycle`, `ErrUnsupportedFanIn`, `ErrSubWorkflowNameCollision` | Graph validation at construction |
 | `ErrNodeFailed` (+ `*NodeRunError`) | A node failed after retries |
-| `ErrNodeInterrupted`, `ErrNodeWaitingForOutput` | A node paused for human input |
+| `ErrNodeInterrupted` | A node paused for human input |
+| `ErrNodeWaitingForOutput` | A `RunNode` child with `WaitForOutput` finished without output, parking its parent (wraps `ErrNodeInterrupted`) |
 | `ErrInputValidation` | Input failed a declared schema (not retried by default) |
 | `ErrMultipleOutputs`, `ErrMultipleRoutingEvents`, `ErrMultipleTerminalOutputs` | Output/routing contract violations |
 | `ErrInvalidRunNodeContext`, `ErrInvalidRunID`, `ErrOutputAlreadyDelegated` | `RunNode` misuse |

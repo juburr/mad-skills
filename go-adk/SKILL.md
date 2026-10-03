@@ -96,7 +96,7 @@ myAgent, err := llmagent.New(llmagent.Config{
 
 | Field | Purpose |
 |---|---|
-| `Name` | Unique name within the agent tree. Cannot be `"user"`. |
+| `Name` | Unique name within the agent tree. Do not use `"user"` (reserved for user events; not validated). |
 | `Description` | One-line description used by parent agents for delegation decisions. |
 | `Model` | `model.LLM` implementation. |
 | `Instruction` | System prompt. Supports `{state_key}`, `{key?}` (optional), and `{artifact.name}` substitution. A missing non-optional key is an error. |
@@ -178,7 +178,7 @@ a, err := llmagent.New(llmagent.Config{
 })
 ```
 
-Always set `Transport` or `Endpoint`: at v2.5.0 an empty config is accepted and panics at tool discovery. Filter with `tool.FilterToolset(ts, tool.AllowedToolsPredicate(names))`. For HITL confirmation, per-user GCP credentials, and result handling, read `references/integrations.md`.
+Always set `Transport` or `Endpoint`: at v2.5.0 an empty config is accepted and fails later at tool discovery with a nil-pointer panic. Filter with `tool.FilterToolset(ts, tool.AllowedToolsPredicate(names))`. For HITL confirmation, per-user GCP credentials, and result handling, read `references/integrations.md`.
 
 ### AgentTool
 
@@ -314,7 +314,7 @@ for event, err := range r.Run(ctx, "user1", resp.Session.ID(), input, agent.RunC
             }
         }
     }
-    if event.Output != nil { // Graph workflow function nodes report results here, without Content.
+    if event.Output != nil { // Graph workflow node outputs (plain function nodes set no Content).
         fmt.Println(event.Output)
     }
 }
@@ -475,14 +475,14 @@ Statuses verified against v2.5.0 source (2026-10).
 - **Root agent must be chat mode.** A root `llmagent` with `ModeTask` or `ModeSingleTurn` fails with `root agent X must be a chat LlmAgent`. Single_turn and task sub-agents are tools, not `transfer_to_agent` targets.
 - **Undeclared Mode depends on placement.** The same `llmagent` is chat as a sub-agent but single_turn (current turn only) as a graph node. Declare `Mode` when reusing one agent instance.
 - **Nested loop escalation ([#522](https://github.com/google/adk-go/issues/522), still present at v2.5.0).** `Escalate` inside a nested `loopagent` also stops the enclosing loop. Wrap the inner loop to clear `Escalate` on forwarded events (code in `references/orchestration.md`), or use a graph back-edge.
-- **Graph workflow results live in `event.Output`.** Function-node outputs have no `Content`; loops that print only text show nothing. Composite agents wrapped as graph nodes produce `nil` output.
-- **Graph limits at v2.5.0.** Tool confirmation inside a graph agent node is not resumed (use `workflow.RequestInput`); fan-in needs a `JoinNode`; unmatched routes without `workflow.Default` dead-end silently.
+- **Graph workflow results live in `event.Output`.** `NewFunctionNode` outputs have no `Content`, so loops that print only text show nothing. Composite agents wrapped as graph nodes produce `nil` output.
+- **Graph limits at v2.5.0.** Tool confirmation inside a graph agent node is not resumed (ask with `workflow.NewRequestInputEvent` or `workflow.ResumeOrRequestInput` instead); fan-in needs a `JoinNode`; unmatched routes without `workflow.Default` dead-end silently; plain text sent while a graph is paused restarts it from `Start`.
 - **Web launcher defaults (v2.5.0).** Binds `127.0.0.1` (containers need `web -host 0.0.0.0`); cross-origin browsers get 403; bodies over 10 MiB get 400; debug/graph routes need `-include_debug_api`. REST auth is code-only and covers the REST API only (A2A and trigger routes stay open).
 - **Database sessions need `database.AutoMigrate` on every startup.** v2 releases add columns; `AppendEvent` fails until they exist.
 - **Agents cannot implement `agent.Agent` directly.** The interface has an unexported method; construct agents via `agent.New`, `llmagent.New`, `workflowagent.New`, or the workflow agent constructors.
 - **Agent identity auto-injection.** Agent `Name` and `Description` are injected into the system prompt (except for single_turn agents). Don't repeat identity text in `Instruction`.
 - **OpenAI models (`openaimodel`, experimental).** An empty `APIKey` sends `OPENAI_API_KEY` to a custom `BaseURL`; structured output makes every field required; input is text-only; Gemini built-in tools are rejected.
-- **MCP config.** A `mcptoolset.Config` with neither `Transport` nor `Endpoint` is accepted at construction and panics later.
+- **MCP config.** A `mcptoolset.Config` with neither `Transport` nor `Endpoint` is accepted at construction and fails later with a nil-pointer panic during tool discovery.
 - **Parallel agent input.** Inject data via session state (`OutputKey` + `{placeholder}`) rather than relying on conversation history across parallel branches.
 
 Fixed since v1.4.0 (drop old workarounds): OutputKey overwritten by tool-call events ([#577](https://github.com/google/adk-go/issues/577), fixed v2.4.0/v1.7.0); `loadartifactstool` panic without an `ArtifactService` ([#283](https://github.com/google/adk-go/issues/283), now an error since v2.3.0/v1.6.1); nil `RunConfig` panic when embedding ([#586](https://github.com/google/adk-go/issues/586), fixed v2.3.0/v1.6.1); `OutputSchema` never disabled tools.

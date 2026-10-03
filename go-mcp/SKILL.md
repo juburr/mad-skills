@@ -187,7 +187,7 @@ func deleteRepo(ctx context.Context, req *mcp.CallToolRequest, in DeleteInput) (
 - Never set both `InputRequests` and `Content` — the SDK rejects that as a server bug (`-32603`).
 - Only request what the client declared (check `req.ClientCapabilities()`). Older clients send `elicitation: {}` (nil `Form` and `URL`) to mean form support.
 - The retry is a new, independent request; over stateless HTTP another instance may serve it. Carry progress in `RequestState`, not in memory, and treat it as attacker-controlled: integrity-protect it (HMAC or AEAD) and bind it to the caller and a short expiry.
-- Legacy (≤ 2025-11-25) clients still work: the SDK fulfils the requests itself with server-to-client calls and re-invokes the handler once. That needs a bidirectional session (stdio, in-memory, stateful HTTP) — it fails for legacy clients over stateless HTTP.
+- Legacy (≤ 2025-11-25) clients still work: the SDK fulfils the requests itself with server-to-client calls and re-invokes the handler once, so collect all input in one round for them. That needs a bidirectional session (stdio, in-memory, stateful HTTP) — it fails for legacy clients over stateless HTTP.
 
 Do **not** call `req.Session.Elicit` / `CreateMessage` / `ListRoots` in new code: they return an error on 2026-07-28 sessions. See `references/protocol-2026-07-28.md` for manual retry handling, load shedding, and a `RequestState` signing example.
 

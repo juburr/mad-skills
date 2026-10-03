@@ -166,6 +166,7 @@ root, err := workflowagent.New(workflowagent.Config{
 
 - A non-join node with two or more unconditional incoming edges fails `workflow.New` with `ErrUnsupportedFanIn`.
 - **Never route conditionally into a JoinNode**: a predecessor skipped by a route never completes, so the join never fires.
+- **Never join across a branch that pauses for human input** (v2.5.0, upstream issue #1568): when one predecessor completes and another pauses, the resumed run does not restore the completed predecessor, so the join never fires and downstream nodes never run. Ask for input **before** the fan-out, or orchestrate the branches in a dynamic node (`RunNode` + `ResumeOrRequestInput`) instead of a static join.
 - More than one terminal node producing output fails the run with `ErrMultipleTerminalOutputs`. Converge branches with a JoinNode.
 
 ## ParallelWorker
@@ -407,6 +408,7 @@ for ev, err := range r.Run(ctx, userID, sessionID, msg, agent.RunConfig{}) {
 
 ## Limitations at v2.5.0
 
+- A `JoinNode` whose predecessors include a node that paused for human input never fires after the resume (see Fan-Out and Fan-In).
 - `workflowagent.New` calls `workflow.New` with no options, so `workflow.WithMaxConcurrency` and `workflow.WithStateSchema` are unreachable through the adapter.
 - `NewEmittingFunctionNodeWithSchema` does not infer nil schemas despite its doc comment; pass schemas explicitly.
 - The dynamic node output schema is not validated.

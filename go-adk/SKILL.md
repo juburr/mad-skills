@@ -188,7 +188,7 @@ Wrap an agent as a callable tool that runs in a **separate in-memory session** (
 imageTool := agenttool.New(imageAgent, nil) // &agenttool.Config{SkipSummarization: true} ends the parent's turn
 ```
 
-Prefer a `Mode: llmagent.ModeSingleTurn` sub-agent when the specialist's tool calls should stay in the parent session's history. Since v2.5.0, agenttool children share the parent's artifact store.
+The child runs without the parent's runner plugins and does not write state back. Prefer a `Mode: llmagent.ModeSingleTurn` sub-agent when the specialist's tool calls should stay in the parent session and be seen by plugins. Since v2.5.0, agenttool children share the parent's artifact store.
 
 ### Built-in Gemini Tools
 
@@ -273,15 +273,7 @@ For all agent-based patterns with complete code (parallel gather, critic/refiner
 | `temp:` | Current invocation only | Stripped from stored events |
 | *(none)* | Current session | Session lifetime |
 
-Prefixes do not compose: `app:temp:x` is an app-scoped key that persists. `OutputKey` stores an agent's final text in state, and `{key}` placeholders in `Instruction` read it back.
-
-```go
-resp, _ := sessionService.Create(ctx, &session.CreateRequest{
-    AppName: "my_app",
-    UserID:  "user1",
-    State:   map[string]any{"topic": "quantum computing"},
-})
-```
+Prefixes do not compose: `app:temp:x` is an app-scoped key that persists. `OutputKey` stores an agent's final text in state, and `{key}` placeholders in `Instruction` read it back. Seed state with `session.CreateRequest.State` (below) or `runner.WithStateDelta`.
 
 ## Running Agents
 
@@ -289,7 +281,10 @@ resp, _ := sessionService.Create(ctx, &session.CreateRequest{
 
 ```go
 sessionService := session.InMemoryService()
-resp, _ := sessionService.Create(ctx, &session.CreateRequest{AppName: "my_app", UserID: "user1"})
+resp, _ := sessionService.Create(ctx, &session.CreateRequest{
+    AppName: "my_app", UserID: "user1",
+    State: map[string]any{"topic": "quantum computing"}, // Initial session state.
+})
 
 r, err := runner.New(runner.Config{
     AppName:        "my_app",
@@ -344,6 +339,9 @@ With no `Summarizer`, the root agent's model summarizes (the root must be an LLM
 live, events, err := r.RunLive(ctx, "user1", sessionID, agent.LiveRunConfig{
     ResponseModalities: []genai.Modality{genai.ModalityAudio},
 })
+if err != nil {
+    return err // live is nil on error: check before deferring Close.
+}
 defer live.Close() // Always close: it tears down the flow and the model connection.
 // live.Send(agent.LiveRequest{Content: ...}) to send; iterate events to receive.
 ```
@@ -476,7 +474,7 @@ Statuses verified against v2.5.0 source (2026-10).
 - **Undeclared Mode depends on placement.** The same `llmagent` is chat as a sub-agent but single_turn (current turn only) as a graph node. Declare `Mode` when reusing one agent instance.
 - **Nested loop escalation ([#522](https://github.com/google/adk-go/issues/522), still present at v2.5.0).** `Escalate` inside a nested `loopagent` also stops the enclosing loop. Wrap the inner loop to clear `Escalate` on forwarded events (code in `references/orchestration.md`), or use a graph back-edge.
 - **Graph workflow results live in `event.Output`.** `NewFunctionNode` outputs have no `Content`, so loops that print only text show nothing. Composite agents wrapped as graph nodes produce `nil` output.
-- **Graph limits at v2.5.0.** Tool confirmation inside a graph agent node is not resumed (ask with `workflow.NewRequestInputEvent` or `workflow.ResumeOrRequestInput` instead); fan-in needs a `JoinNode`; unmatched routes without `workflow.Default` dead-end silently; plain text sent while a graph is paused restarts it from `Start`.
+- **Graph limits at v2.5.0.** Tool confirmation inside a graph agent node is not resumed (ask with `workflow.NewRequestInputEvent` or `workflow.ResumeOrRequestInput` instead); fan-in needs a `JoinNode`, and a join across a branch that pauses for input never fires after the resume; unmatched routes without `workflow.Default` dead-end silently; plain text sent while a graph is paused restarts it from `Start`.
 - **Web launcher defaults (v2.5.0).** Binds `127.0.0.1` (containers need `web -host 0.0.0.0`); cross-origin browsers get 403; bodies over 10 MiB get 400; debug/graph routes need `-include_debug_api`. REST auth is code-only and covers the REST API only (A2A and trigger routes stay open).
 - **Database sessions need `database.AutoMigrate` on every startup.** v2 releases add columns; `AppendEvent` fails until they exist.
 - **Agents cannot implement `agent.Agent` directly.** The interface has an unexported method; construct agents via `agent.New`, `llmagent.New`, `workflowagent.New`, or the workflow agent constructors.

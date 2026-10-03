@@ -280,7 +280,7 @@ travelPlanner, _ := llmagent.New(llmagent.Config{ // Root: leave Mode unset (cha
 - An agent with no declared `Mode` is resolved per placement: chat as a root or sub-agent, single_turn as a graph node. Declare `Mode` explicitly when one agent instance is reused in several places.
 - `task_completed` is unrelated: it is a tool `sequentialagent` injects only during `RunLive`.
 
-**Single-turn vs. AgentTool:** single_turn sub-agents keep the specialist's tool calls in the parent session's history, and the repo recommends them over the older `agenttool` pattern. Use `agenttool.New(a, &agenttool.Config{SkipSummarization: ...})` when the child should run in a **separate in-memory session** (its events never enter the parent session). The child gets a copy of the parent's state, but its state changes are **not** written back; return data through the tool result. Since v2.5.0, `agenttool` children share the parent's artifact store.
+**Single-turn vs. AgentTool:** single_turn sub-agents keep the specialist's tool calls in the parent session's history, and the repo recommends them over the older `agenttool` pattern. Use `agenttool.New(a, &agenttool.Config{SkipSummarization: ...})` when the child should run in a **separate in-memory session** (its events never enter the parent session). The child gets a copy of the parent's state, but its state changes are **not** written back (return data through the tool result), and it runs **without the parent's runner plugins**, so plugin-based logging, metrics, and guardrails do not see its calls. Since v2.5.0, `agenttool` children share the parent's artifact store.
 
 ## Pattern 6: Custom Agent with Planning Loop
 

@@ -18,8 +18,12 @@ Launchers, command-line flags, the REST server's security model, embedding the R
 When composing a custom `web.NewLauncher(...)`, pass `webui` **before** `api`; with `api -path_prefix ""` the API's catch-all would otherwise shadow `/ui/`.
 
 ```go
+loader, err := agent.NewMultiLoader(rootAgent, otherAgent) // Errors on duplicate names.
+if err != nil {
+    log.Fatal(err)
+}
 config := &launcher.Config{
-    AgentLoader:     agent.NewMultiLoader(rootAgent, otherAgent), // or agent.NewSingleLoader(rootAgent)
+    AgentLoader:     loader, // Or agent.NewSingleLoader(rootAgent), which returns no error.
     SessionService:  sessionService,
     ArtifactService: artifactService,
     MemoryService:   memoryService,
@@ -275,7 +279,8 @@ adkgo deploy agentengine -p my-project -r us-central1 -s "My Agent" -e ./main.go
 | `deploy cloudrun` | `-p/--project_name`, `-r/--region`, `-s/--service_name`, `-e/--entry_point_path`, `--server_port` (8080), `--proxy_port` (8081), `--api`, `--debug_api` (v2.3.0+), `--webui`, `--a2a`, `-a/--a2a_agent_url`, `--pubsub*`, `--eventarc*` |
 | `deploy agentengine` | `-p/--project_name`, `-r/--region`, `-s/--name`, `-e/--entry_point_path`, `-d/--source_dir`, `--agent_engine_id` (update an existing instance), `--mem_deploy`, `--mem_model`, `--mem_ttl` |
 
-- `cloudrun` builds a static linux/amd64 binary into a distroless image whose command runs `web -host 0.0.0.0 ...`, deploys with `--no-allow-unauthenticated`, injects a Secret Manager secret named `GOOGLE_API_KEY`, and starts `gcloud run services proxy` so the UI is at `http://127.0.0.1:8081/ui/`.
+- `cloudrun` builds a static linux/amd64 binary into a distroless image whose command runs `web -host 0.0.0.0 ...`, deploys with `--no-allow-unauthenticated`, and starts `gcloud run services proxy` so the UI is at `http://127.0.0.1:8081/ui/`.
+- **`cloudrun` prerequisites:** the deploy always passes `--set-secrets=GOOGLE_API_KEY=GOOGLE_API_KEY:latest` and no `--service-account`, so before running it (1) create a Secret Manager secret named exactly `GOOGLE_API_KEY`, and (2) grant the Cloud Run runtime service account (the Compute Engine default service account, `PROJECT_NUMBER-compute@developer.gserviceaccount.com`) `roles/secretmanager.secretAccessor` on it. Otherwise the deploy fails after the build. v2.5.0 offers no flag to choose another secret name or service account; when you need either, run your own `gcloud run deploy` (with `--service-account` and `--set-secrets` of your choice) against the same launcher command line.
 - `agentengine` builds from source with `FROM golang:<go.mod version>` and `GOTOOLCHAIN=auto`; the entry point must serve the `agentengine` sublauncher.
 
 ## Context Compaction on Serving Surfaces

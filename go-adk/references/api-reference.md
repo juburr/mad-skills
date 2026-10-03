@@ -535,7 +535,7 @@ type Config struct {
 }
 ```
 
-Each call runs the child in a fresh in-memory session seeded with a copy of the parent's state, with a fresh in-memory memory service. **State changes made by the child are not written back to the parent**; return data through the tool result. Since v2.5.0 the child shares the parent's artifact store. Output is validated against the child's `OutputSchema` if set, else returned as `{"result": text}`.
+Each call runs the child through a new runner with a fresh in-memory session seeded with a copy of the parent's state, and a fresh in-memory memory service. **State changes made by the child are not written back to the parent**; return data through the tool result. **The parent's runner plugins are not propagated**: plugin callbacks (logging, metrics, guardrails) never see the child's model and tool calls. Use a `ModeSingleTurn` or `ModeTask` sub-agent when plugins must cover delegated work. Since v2.5.0 the child shares the parent's artifact store. Output is validated against the child's `OutputSchema` if set, else returned as `{"result": text}`.
 
 ## Tool Helpers
 

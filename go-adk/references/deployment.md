@@ -212,10 +212,18 @@ ctrl, err := triggers.NewPubSubControllerWithConfig(triggers.ControllerConfig{
         MaxRetries: 3, BaseDelay: time.Second, MaxDelay: 10 * time.Second, MaxConcurrentRuns: 100,
     },
 })
+if err != nil {
+    log.Fatal(err)
+}
 oidc, err := authn.NewGoogleOIDC(authn.GoogleOIDCConfig{
-    Audience:               "https://my-agent-abc123.a.run.app",
+    // Pub/Sub's default token audience is the full push endpoint URL. Match it exactly,
+    // or set --push-auth-token-audience on the subscription and use that value here.
+    Audience:               "https://my-agent-abc123.a.run.app/apps/my_app/trigger/pubsub",
     AllowedServiceAccounts: []string{"pubsub-invoker@my-proj.iam.gserviceaccount.com"},
 })
+if err != nil {
+    log.Fatal(err)
+}
 r := mux.NewRouter()
 r.Handle("/apps/{app_name}/trigger/pubsub",
     authn.Middleware(oidc)(http.HandlerFunc(ctrl.PubSubTriggerHandler))).Methods(http.MethodPost)

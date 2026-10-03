@@ -272,7 +272,7 @@ Behavior notes:
 - At v2.5.0, a config with neither `Transport` nor `Endpoint` is **not** rejected by `New`; it fails later during tool discovery with a nil-pointer panic (under the runner, a run error such as `node "root" panicked: ...`). Validate your config.
 - `Auth` with a non-HTTP transport fails at construction. Do not combine `Auth` with the transport's own `OAuthHandler`.
 - Sessions are created lazily on the first LLM request and reconnect automatically on closed connections or missing sessions. Tool discovery paginates `ListTools`.
-- **Tool calls are at-least-once.** When `CallTool` fails with a closed connection, missing session, or EOF, ADK reconnects and **resends the same call once**. If the server had already executed it before the connection dropped, a mutating tool (create record, send message, charge payment) runs twice while ADK reports one result (upstream issue #1689). Make mutating MCP tools idempotent (e.g. idempotency keys), or gate them behind confirmation.
+- **Tool calls are at-least-once.** When `CallTool` fails with a closed connection, missing session, or EOF, ADK reconnects and **resends the same call once**. If the server had already executed it before the connection dropped, a mutating tool (create record, send message, charge payment) runs twice while ADK reports one result (upstream issue #1689). Make mutating MCP tools idempotent (e.g. accept an idempotency key) or avoid exposing non-idempotent operations. Confirmation does not help: it completes before `CallTool`, so the confirmed call is the one that gets resent.
 - Results: `StructuredContent` is returned as `{"output": ...}`; otherwise text is returned as `{"output": "<text>"}`. Since v2.4.0, empty text is valid, and non-text content (images, audio, resource links) is rendered as bracketed labels instead of being dropped (binary payloads are not forwarded to the model).
 - `IsError: true` results become a tool error: `Tool execution failed. Details: ...`.
 - For HTTP servers with idle timeouts, the cached session can go stale; tune server timeouts or recreate the toolset on persistent connection errors.
@@ -335,6 +335,9 @@ authed := &http.Client{
 import "google.golang.org/adk/v2/auth/gcp"
 
 client, err := gcp.NewClient(ctx, nil) // Build ONE long-lived client; per-request clients defeat the cache.
+if err != nil {
+    return err
+}
 perUser, err := gcp.NewProvider(ctx, gcp.ProviderConfig{
     Scheme: gcp.ProviderScheme{
         Name:   "projects/my-proj/locations/global/connectors/github",
@@ -343,18 +346,55 @@ perUser, err := gcp.NewProvider(ctx, gcp.ProviderConfig{
     Client: client,
     Store:  auth.NewInMemoryCredentialStore(),
 })
-userTools, err := mcptoolset.New(mcptoolset.Config{
-    Transport: &mcp.StreamableClientTransport{
-        Endpoint:   "https://mcp.example.com/mcp",
-        HTTPClient: &http.Client{CheckRedirect: refuseRedirects}, // Required by gcp.NewProvider.
+if err != nil {
+    return err
+}
+
+// One MCP toolset per end user: an MCP session stays bound to the user who opened it.
+userTools := &perUserToolset{
+    sets: map[string]tool.Toolset{},
+    newFor: func(userID string) (tool.Toolset, error) {
+        return mcptoolset.New(mcptoolset.Config{
+            Transport: &mcp.StreamableClientTransport{
+                Endpoint:   "https://mcp.example.com/mcp",
+                HTTPClient: &http.Client{CheckRedirect: refuseRedirects}, // Required by gcp.NewProvider.
+            },
+            Auth: perUser, // Resolves the credential from the request context's ADK identity.
+        })
     },
-    Auth: perUser,
-})
+}
+// llmagent.Config{Toolsets: []tool.Toolset{userTools}, ...}
+```
+
+```go
+// perUserToolset lazily builds one toolset per ADK user ID (implements tool.Toolset).
+type perUserToolset struct {
+    mu     sync.Mutex
+    sets   map[string]tool.Toolset
+    newFor func(userID string) (tool.Toolset, error)
+}
+
+func (p *perUserToolset) Name() string { return "per_user_mcp" }
+
+func (p *perUserToolset) Tools(ctx agent.ReadonlyContext) ([]tool.Tool, error) {
+    p.mu.Lock()
+    ts, ok := p.sets[ctx.UserID()]
+    if !ok {
+        var err error
+        if ts, err = p.newFor(ctx.UserID()); err != nil { // mcptoolset.New does not dial.
+            p.mu.Unlock()
+            return nil, err
+        }
+        p.sets[ctx.UserID()] = ts
+    }
+    p.mu.Unlock()
+    return ts.Tools(ctx) // The MCP session opens lazily under this user's context.
+}
 ```
 
 - The provider fails with `gcp.ErrNoActingUser` when the context carries no ADK identity. ADK does **not** authenticate `session.UserID`; trust comes from your server's authentication.
 - Interactive consent is not wired into the tool layer at v2.5.0: a `*auth.ConsentRequiredError` surfaces as an ordinary tool error.
-- An MCP session is bound to the user that opened it, so `mcptoolset` does not isolate per-user credentials across a shared connection.
+- **Never share one credentialed `mcptoolset` across users.** Its MCP session (and the server-side state behind `Mcp-Session-Id`) is opened by whichever user connects first. Later users' calls carry their own token but run inside that first user's session, so servers that bind identity at `initialize` treat them as the first user. One toolset per user, as above, gives each user their own session (verified with two users against a streamable MCP server). The cache grows with the user count; evict idle entries in long-running servers.
 
 ## A2A Remote Agents (`agent/remoteagent/v2`)
 
@@ -440,7 +480,13 @@ import (
 )
 
 db, err := gorm.Open(sqlite.Open("sessions.db"), &gorm.Config{})
+if err != nil {
+    log.Fatal(err)
+}
 sessions, err := database.NewSessionServiceFromDB(db)
+if err != nil {
+    log.Fatal(err)
+}
 if err := database.AutoMigrate(sessions); err != nil { // Run on EVERY startup.
     log.Fatal(err)
 }
@@ -448,7 +494,7 @@ if err := database.AutoMigrate(sessions); err != nil { // Run on EVERY startup.
 
 - **`database.AutoMigrate` must run on every startup.** The service never creates or alters tables; v2.0.0 added workflow columns and v2.5.0 added transcription columns, and `AppendEvent` fails until they exist.
 - `Get` and `AppendEvent` of every bundled session service wrap `session.ErrNotFound` (v2.4.0); match with `errors.Is`. Custom services must wrap it too (the REST server maps it to 404).
-- Custom session services must persist the v2 event fields (`IsolationScope`, `Routes`, `RequestedInput`, `Output`, `NodeInfo`, `Actions.Compaction`); `session/sessiontestsuite` checks the contract.
+- Custom session services must persist the **complete** event: every `session.Event` field, including the embedded `LLMResponse` fields (such as live-run `InputTranscription`/`OutputTranscription`), `LongRunningToolIDs`, `Actions` (with `Compaction`), and the v2 fields (`IsolationScope`, `Routes`, `RequestedInput`, `Output`, `NodeInfo`). Storing the JSON-encoded event is the simplest way to keep up as fields are added. `session/sessiontestsuite` checks the contract.
 - `artifact.ArtifactVersion.CreateTime` is `time.Time` (was `float64` in v1). `CanonicalURI` is a stable identity (`gs://bucket/object` for GCS since v2.4.0), not a download URL. `gcsartifact.Save` can return `gcsartifact.ErrVersionConflict` under concurrent writers; retry it.
 
 ### BigQuery Agent Analytics Plugin

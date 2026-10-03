@@ -2,23 +2,24 @@
 name: go-mcp
 description: Guides development of MCP servers and clients in Go using the official
   SDK (github.com/modelcontextprotocol/go-sdk). Use when building MCP servers, registering
-  tools/resources/prompts, choosing transports, adding authentication, or integrating
+  tools/resources/prompts, choosing transports, adding authentication, adopting the
+  stateless 2026-07-28 protocol (multi round-trip requests, stateless HTTP), or integrating
   MCP endpoints into existing Go services.
 ---
 
 # MCP Go
 
-> **Verified against SDK v1.6.1** (released 2026-05-22). Supports MCP spec versions 2025-11-25, 2025-06-18, 2025-03-26, and 2024-11-05. Requires Go 1.25+. If your knowledge of this SDK predates v1.5, read `references/version-notes.md` first — several defaults and patterns changed.
+> **Verified against SDK v1.8.0** (released 2026-09-14). Supports MCP spec versions 2026-07-28 (default), 2025-11-25, 2025-06-18, 2025-03-26, and 2024-11-05. Requires Go 1.25+. If your knowledge of this SDK predates v1.7, read `references/version-notes.md` first — the default protocol is now stateless, and several APIs and defaults changed.
 
-The official Go SDK for the Model Context Protocol (`github.com/modelcontextprotocol/go-sdk/mcp`). Do **not** use the third-party `github.com/mark3labs/mcp-go` package. If migrating from `mark3labs/mcp-go`, read `references/migration-from-mark3labs.md`. Both libraries are wire-compatible: an official SDK client works with a mark3labs server (and vice versa) across all transports, so you can migrate incrementally. The one edge case is legacy SSE transport error handling — mark3labs returns JSON-RPC-formatted errors on the HTTP POST endpoint while the official SDK returns plain text, which may affect clients that parse POST error responses as JSON-RPC. This stems from the 2024-11-05 SSE spec being silent on POST error formatting; neither implementation is wrong.
+The official Go SDK for the Model Context Protocol (`github.com/modelcontextprotocol/go-sdk/mcp`). Do **not** use the third-party `github.com/mark3labs/mcp-go` package. If migrating from `mark3labs/mcp-go`, read `references/migration-from-mark3labs.md`. The two libraries interoperate on the wire, so you can migrate incrementally — with one exception: a default mark3labs client fails against an official server behind a *stateful* HTTP handler; serve with `Stateless: true` (see below) to avoid it.
 
 ```bash
-go get github.com/modelcontextprotocol/go-sdk@v1.6.1
+go get github.com/modelcontextprotocol/go-sdk/mcp@v1.8.0
 ```
 
-Pin an explicit version rather than `@latest`, especially for air-gapped module mirrors. Newer versions are fine — the SDK guarantees no breaking API changes within v1.
+Get the `mcp` package path, not the bare module path: the module root contains no package, so `go get github.com/modelcontextprotocol/go-sdk` records an `// indirect` requirement without the `go.sum` entries the build needs. Pin an explicit version rather than `@latest`, especially for air-gapped module mirrors. Newer versions are fine — the SDK guarantees no breaking API changes within v1.
 
-Most MCP protocol types are in the `mcp` package. Auth helpers are in `auth` and `oauthex`. Custom transport authors will also use `jsonrpc`.
+Most MCP protocol types are in the `mcp` package. Auth helpers are in `auth`, `auth/extauth`, and `oauthex`. Custom transport authors will also use `jsonrpc`.
 
 ```go
 import (
@@ -26,6 +27,22 @@ import (
     "github.com/modelcontextprotocol/go-sdk/auth"
 )
 ```
+
+## Protocol 2026-07-28 in Brief
+
+`Client.Connect` negotiates the version automatically: it probes `server/discover` and falls back to the legacy `initialize` handshake (capped at 2025-11-25) when the server does not offer 2026-07-28. Handler code mostly stays the same. These are the differences that matter:
+
+| Concern | 2026-07-28 session | 2025-11-25 and older |
+|---|---|---|
+| Streamable HTTP | Served only by a handler with `Stateless: true` | Stateful or stateless handler |
+| Asking the client for input | Return `InputRequests` from the handler (see [below](#asking-the-client-for-input)) | Same code works; the SDK shims it |
+| `ServerSession.Elicit` / `CreateMessage` / `ListRoots` | Return an error | Work |
+| `Ping`, `KeepAlive`, `SetLoggingLevel`, `InitializedHandler` | Removed from the protocol; do not rely on them | Work |
+| Session ID | None over stateless HTTP (`ServerSession.ID()` is `""`) | Assigned by stateful HTTP |
+| Client info / capabilities | Sent on every request: `req.ClientInfo()`, `req.ClientCapabilities()`, `req.ProtocolVersion()` | Same accessors (read from the handshake) |
+| Stream resumption (`EventStore`) | Removed; a broken stream loses the request | Opt-in |
+
+Roots, sampling, and logging are **deprecated** as of 2026-07-28 (functional for at least twelve more months). In new servers, take paths as tool arguments, call LLM provider APIs directly, and log to stderr or OpenTelemetry. Read `references/protocol-2026-07-28.md` for discovery, subscriptions, caching, HTTP header mirroring, and the compatibility matrix.
 
 ## Creating a Server
 
@@ -58,6 +75,8 @@ mcp.AddTool(server, &mcp.Tool{
     Description: "Search the knowledge base.",
 }, search)
 ```
+
+The output type may be any Go type with a valid JSON Schema (struct, map, slice, or primitive) — not only objects.
 
 Non-generic form (manual argument parsing). `InputSchema` is **required** here — `server.AddTool` panics if it is nil. For a tool with no input, use `{"type": "object"}`:
 
@@ -118,12 +137,65 @@ server.AddPrompt(&mcp.Prompt{
 
 ### Removing Features at Runtime
 
+Call `server.RemoveTools("old-tool")`, `RemoveResources(uri)`, `RemovePrompts(name)`, or `RemoveResourceTemplates(uriTemplate)`; each takes any number of arguments.
+
+## Asking the Client for Input
+
+Use **Multi Round-Trip Requests** (MRTR) to ask for user confirmation (elicitation), an LLM completion (sampling), or the client's roots. Return a result with `InputRequests` set and `Content` empty; the client's built-in middleware fulfils each request with its configured handler and retries the same call with `InputResponses`. The handler therefore runs once per round:
+
 ```go
-server.RemoveTools("old-tool")
-server.RemoveResources("config://app/deprecated")
-server.RemovePrompts("old-prompt")
-server.RemoveResourceTemplates("file:///old/{path}")
+import "github.com/google/jsonschema-go/jsonschema"
+
+func deleteRepo(ctx context.Context, req *mcp.CallToolRequest, in DeleteInput) (*mcp.CallToolResult, any, error) {
+    // Bind the answer to this caller and repo (helpers: references/protocol-2026-07-28.md).
+    bind := pendingState{Subject: callerID(req), Tool: "delete_repo", ArgsSum: in.Repo}
+    answer, answered := req.Params.InputResponses["confirm"].(*mcp.ElicitResult)
+    if !answered {
+        caps := req.ClientCapabilities() // URL-only clients cannot render forms
+        if caps == nil || caps.Elicitation == nil || (caps.Elicitation.Form == nil && caps.Elicitation.URL != nil) {
+            return nil, nil, fmt.Errorf("client cannot confirm deletion; refusing")
+        }
+        bind.Expires = time.Now().Add(5 * time.Minute)
+        state, err := sealState(stateKey, bind)
+        if err != nil {
+            return nil, nil, err
+        }
+        return &mcp.CallToolResult{
+            InputRequests: mcp.InputRequestMap{
+                "confirm": &mcp.ElicitParams{
+                    Message: "Delete " + in.Repo + "?",
+                    RequestedSchema: &jsonschema.Schema{
+                        Type:       "object",
+                        Properties: map[string]*jsonschema.Schema{"confirm": {Type: "boolean"}},
+                    },
+                },
+            },
+            RequestState: state,
+        }, nil, nil
+    }
+    if _, err := openState(stateKey, req.Params.RequestState, bind.Subject, bind.Tool, bind.ArgsSum); err != nil {
+        return nil, nil, fmt.Errorf("confirmation does not match this request: %w", err) // e.g., arguments changed
+    }
+    if answer.Action != "accept" || answer.Content["confirm"] != true {
+        return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "Cancelled."}}}, nil, nil
+    }
+    // ... delete ...
+}
 ```
+
+| Input request value | Retry carries |
+|---|---|
+| `*mcp.ElicitParams` | `*mcp.ElicitResult` |
+| `*mcp.CreateMessageParams` or `*mcp.CreateMessageWithToolsParams` | `*mcp.CreateMessageWithToolsResult` (always this type) |
+| `*mcp.ListRootsParams` | `*mcp.ListRootsResult` |
+
+- MRTR works on `tools/call`, `prompts/get`, and `resources/read`; `GetPromptResult` and `ReadResourceResult` carry the same `InputRequests`/`RequestState` fields.
+- While requesting input, leave every content field empty — `Content`, `StructuredContent`, prompt `Messages`, resource `Contents` — or the SDK rejects it as a server bug (`-32603`). (`AddTool` discards a typed handler's output on that round.)
+- Only request what the client declared (check `req.ClientCapabilities()`). Older clients send `elicitation: {}` (nil `Form` and `URL`) to mean form support.
+- The retry is a new, independent request; over stateless HTTP another instance may serve it. Carry progress in `RequestState`, not in memory, and treat it and `InputResponses` as attacker-controlled: integrity-protect the state (HMAC or AEAD) and bind it to the caller, the salient arguments, and a short expiry, as above, so an answer cannot be replayed onto different arguments.
+- Legacy (≤ 2025-11-25) clients still work: the SDK fulfils the requests itself with server-to-client calls and re-invokes the handler once, so collect all input in one round for them. That needs a bidirectional session (stdio, in-memory, stateful HTTP) — it fails for legacy clients over stateless HTTP.
+
+Do **not** call `req.Session.Elicit` / `CreateMessage` / `ListRoots` in new code: they return an error on 2026-07-28 sessions. See `references/protocol-2026-07-28.md` for manual retry handling, load shedding, and a `RequestState` signing example.
 
 ## Transports
 
@@ -131,7 +203,7 @@ server.RemoveResourceTemplates("file:///old/{path}")
 |---|---|---|---|
 | **Stdio** | `mcp.StdioTransport{}` | `mcp.CommandTransport{Command: exec.Command("server")}` | Local subprocess, IDE integrations |
 | **Streamable HTTP** | `mcp.NewStreamableHTTPHandler(getServer, opts)` | `mcp.StreamableClientTransport{Endpoint: url}` | Remote servers, production deployments |
-| **SSE** (legacy) | `mcp.NewSSEHandler(getServer, opts)` | `mcp.SSEClientTransport{Endpoint: url}` | Legacy clients only; prefer Streamable HTTP |
+| **SSE** (deprecated) | `mcp.NewSSEHandler(getServer, opts)` | `mcp.SSEClientTransport{Endpoint: url}` | Legacy clients only; never negotiates 2026-07-28 |
 | **In-Memory** | `mcp.NewInMemoryTransports()` | Same pair | Testing |
 
 ### Stdio Server
@@ -142,7 +214,7 @@ if err := server.Run(ctx, &mcp.StdioTransport{}); err != nil {
 }
 ```
 
-`Run` blocks until the client disconnects. Use for CLI tools and IDE integrations.
+`Run` blocks until the client disconnects. Use for CLI tools and IDE integrations. Stdio supports every protocol version.
 
 ### Streamable HTTP Server
 
@@ -150,13 +222,21 @@ if err := server.Run(ctx, &mcp.StdioTransport{}); err != nil {
 handler := mcp.NewStreamableHTTPHandler(
     func(req *http.Request) *mcp.Server { return server },
     &mcp.StreamableHTTPOptions{
-        SessionTimeout: 30 * time.Minute,
-        Logger:         slog.Default(),
+        Stateless:                    true, // required to serve 2026-07-28
+        PropagateRequestCancellation: true, // cancel handler ctx when the client disconnects
+        Logger:                       slog.Default(),
     },
 )
 http.Handle("/mcp", handler)
 log.Fatal(http.ListenAndServe(":8080", nil))
 ```
+
+Choose the mode deliberately:
+
+| Mode | Serves | Behavior |
+|---|---|---|
+| `Stateless: true` (recommended for new servers) | 2026-07-28 and legacy clients | No `Mcp-Session-Id`; GET/DELETE return 405; a fresh `ServerSession` per request, so any replica can serve any request. Legacy clients get no server-to-client requests or list-changed notifications. |
+| Stateful (default) | 2025-11-25 and older only; newer clients fall back automatically | Session IDs, `SessionTimeout`, optional `EventStore` resumption, server-to-client requests for legacy clients. Needs sticky routing across replicas. |
 
 The `getServer` callback receives the HTTP request, enabling per-request server instances (e.g., different tools per tenant). When creating a new `*mcp.Server` per request, share a schema cache across instances to avoid re-deriving tool schemas via reflection on every request:
 
@@ -164,14 +244,16 @@ The `getServer` callback receives the HTTP request, enabling per-request server 
 cache := mcp.NewSchemaCache() // create once, share across all servers
 handler := mcp.NewStreamableHTTPHandler(func(req *http.Request) *mcp.Server {
     return mcp.NewServer(impl, &mcp.ServerOptions{SchemaCache: cache})
-}, nil)
+}, &mcp.StreamableHTTPOptions{Stateless: true})
 ```
 
 ### HTTP Security Defaults
 
-- **DNS rebinding protection is on by default**: requests arriving via localhost with a non-localhost `Host` header are rejected with 403. Opt out with `StreamableHTTPOptions.DisableLocalhostProtection` (also on `SSEOptions`).
-- **Cross-origin protection is off by default** (since v1.6.0). To enable it, wrap the handler: `http.NewCrossOriginProtection().Handler(mcpHandler)`. Do not use the deprecated `StreamableHTTPOptions.CrossOriginProtection` field.
-- **POST requests must have `Content-Type: application/json`**; the escape hatch is `MCPGODEBUG=disablecontenttypecheck=1` (see `references/version-notes.md` for all `MCPGODEBUG` flags).
+- **DNS rebinding protection is on by default**: requests arriving via localhost with a non-localhost `Host` header are rejected with 403. Opt out only with `StreamableHTTPOptions.DisableLocalhostProtection` (also on `SSEOptions`); the `MCPGODEBUG` escape hatch was removed in v1.8.0.
+- **Cross-origin protection is off by default.** The spec requires servers to validate `Origin`; wrap any browser-reachable handler: `http.NewCrossOriginProtection().Handler(mcpHandler)`. Do not use the deprecated `StreamableHTTPOptions.CrossOriginProtection` field.
+- **POST requests must have `Content-Type: application/json`**; this can no longer be disabled.
+- **Request bodies are capped at 4 MiB** (`mcp.DefaultMaxRequestBodyBytes`; larger requests get 413). Raise it with `MaxRequestBodyBytes` on `StreamableHTTPOptions` or `SSEOptions`; a negative value removes the cap — never do that on untrusted networks.
+- **Decoders are bounded**: JSON nesting deeper than 1000 levels is rejected, stdio/IO frames are capped by `MaxLineLength` (16 MiB default), and client SSE events by `MaxEventSize` (16 MiB default).
 
 ### Adding MCP to an Existing HTTP Service
 
@@ -202,7 +284,11 @@ if err != nil {
     log.Fatal(err)
 }
 defer session.Close()
+
+log.Println("negotiated", session.InitializeResult().ProtocolVersion)
 ```
+
+To request an older protocol (e.g., to test legacy behavior), pass `&mcp.ClientSessionOptions{ProtocolVersion: "2025-11-25"}` to `Connect`. The server may still negotiate a different supported version, so assert `session.InitializeResult().ProtocolVersion` when a test needs an exact revision.
 
 ### Calling Tools
 
@@ -224,6 +310,8 @@ for _, c := range result.Content {
 }
 ```
 
+Set `ElicitationHandler` (and, for legacy features, `CreateMessageHandler`) in `ClientOptions` so the client can answer input requests; MRTR retries are automatic.
+
 ### Iterating Over Available Features
 
 Auto-paginating iterators:
@@ -236,6 +324,8 @@ for tool, err := range session.Tools(ctx, nil) {
 for resource, err := range session.Resources(ctx, nil) { /* ... */ }
 for prompt, err := range session.Prompts(ctx, nil) { /* ... */ }
 ```
+
+On 2026-07-28 sessions the client caches list and `resources/read` results for the server-provided `ttlMs`; list-changed and resource-updated notifications invalidate the cache. The cache belongs to the session, not the caller, so never share one session across users.
 
 ## Error Handling
 
@@ -254,7 +344,7 @@ return &mcp.CallToolResult{
 
 ### Go Errors from Typed Handlers
 
-If a typed tool handler returns a regular Go error, the SDK wraps it into a tool error result (`IsError: true`). Do not leak secrets in error strings — the LLM will see them.
+If a typed tool handler returns a regular Go error, the SDK wraps it into a tool error result (`IsError: true`). Input-schema validation failures are reported the same way. Do not leak secrets in error strings — the LLM will see them.
 
 ```go
 // This becomes a tool error visible to the LLM:
@@ -271,9 +361,7 @@ return nil, nil, &jsonrpc.Error{Code: jsonrpc.CodeInternalError, Message: "inter
 
 ### Resource Not Found
 
-```go
-return nil, mcp.ResourceNotFoundError(uri)
-```
+Return `nil, mcp.ResourceNotFoundError(uri)` from the resource handler. The wire code is `-32602` (Invalid Params) since v1.7.0; it was `-32002` before. Update any client that matches on `-32002`.
 
 ## Middleware
 
@@ -284,9 +372,7 @@ type MethodHandler func(ctx context.Context, method string, req mcp.Request) (mc
 type Middleware func(MethodHandler) MethodHandler
 ```
 
-### Receiving Middleware (Incoming Requests)
-
-Use for authentication, logging, metrics:
+Receiving middleware wraps incoming requests — use it for authentication, logging, and metrics:
 
 ```go
 server.AddReceivingMiddleware(func(next mcp.MethodHandler) mcp.MethodHandler {
@@ -297,22 +383,10 @@ server.AddReceivingMiddleware(func(next mcp.MethodHandler) mcp.MethodHandler {
 })
 ```
 
-### Sending Middleware (Outgoing Requests)
+Sending middleware wraps requests and notifications this side *sends* (e.g., list-changed notifications, legacy server-to-client calls) — not responses to incoming requests. Use it for tracing and outbound metrics.
 
-Wraps requests and notifications this side *sends* (e.g., server-to-client `CreateMessage`, list-changed notifications) — not responses to incoming requests. Use for tracing, metrics, adding progress tokens:
-
-```go
-server.AddSendingMiddleware(func(next mcp.MethodHandler) mcp.MethodHandler {
-    return func(ctx context.Context, method string, req mcp.Request) (mcp.Result, error) {
-        start := time.Now()
-        result, err := next(ctx, method, req)
-        slog.Info("sent", "method", method, "duration", time.Since(start))
-        return result, err
-    }
-})
-```
-
-Ordering: `AddReceivingMiddleware(m1, m2, m3)` executes as `m1(m2(m3(handler)))` — m1 runs first.
+- Ordering: `AddReceivingMiddleware(m1, m2, m3)` executes as `m1(m2(m3(handler)))` — m1 runs first.
+- On 2026-07-28 sessions, server middleware also sees `server/discover` and `subscriptions/listen`, and sees each MRTR round as a separate `tools/call`.
 
 ## Authentication
 
@@ -327,45 +401,50 @@ verifier := func(ctx context.Context, token string, req *http.Request) (*auth.To
         return nil, auth.ErrInvalidToken
     }
     return &auth.TokenInfo{
-        UserID: claims.Subject,
-        Scopes: claims.Scopes,
-        Extra:  map[string]any{"tenant_id": claims.TenantID},
+        UserID:     claims.Subject, // binds stateful sessions to this user
+        Scopes:     claims.Scopes,
+        Expiration: claims.ExpiresAt, // required unless AllowMissingExpiration is set
+        Extra:      map[string]any{"tenant_id": claims.TenantID},
     }, nil
 }
 
 middleware := auth.RequireBearerToken(verifier, &auth.RequireBearerTokenOptions{
     ResourceMetadataURL: "https://api.example.com/.well-known/oauth-protected-resource",
     Scopes:              []string{"mcp:read"},
+    ClockSkew:           30 * time.Second, // tolerate IdP clock drift
 })
 
 http.Handle("/mcp", middleware(mcpHandler))
 ```
 
-Access token info inside tool handlers:
+Read token info inside tool handlers from `req.Extra`, which is set per request. Avoid `auth.TokenInfoFromContext(ctx)` there: on a stateful handler, `ctx` carries the values of the request that created the session, so the token can be stale.
 
 ```go
 func myTool(ctx context.Context, req *mcp.CallToolRequest, input MyInput) (*mcp.CallToolResult, any, error) {
-    info := auth.TokenInfoFromContext(ctx)
-    tenantID := info.Extra["tenant_id"].(string)
+    if req.Extra == nil || req.Extra.TokenInfo == nil { // Extra is nil on stdio/in-memory
+        return nil, nil, &jsonrpc.Error{Code: jsonrpc.CodeInvalidRequest, Message: "unauthenticated"}
+    }
+    tenantID, ok := req.Extra.TokenInfo.Extra["tenant_id"].(string)
+    if !ok || tenantID == "" { // fail closed: never run unscoped
+        return nil, nil, &jsonrpc.Error{Code: jsonrpc.CodeInvalidRequest, Message: "token missing tenant"}
+    }
     // Use tenantID for RLS, scoping queries, etc.
 }
 ```
 
 ### Client-Side OAuth
 
-Clients connecting to OAuth-protected servers set an `OAuthHandler` on the transport (no build tag required since v1.5.0):
+Clients connecting to OAuth-protected servers set an `OAuthHandler` on the transport:
 
 ```go
 handler, err := auth.NewAuthorizationCodeHandler(&auth.AuthorizationCodeHandlerConfig{
-    // At least one registration method is required: DynamicClientRegistrationConfig,
-    // PreregisteredClient, or ClientIDMetadataDocumentConfig.
-    DynamicClientRegistrationConfig: &auth.DynamicClientRegistrationConfig{
-        Metadata: &oauthex.ClientRegistrationMetadata{
-            ClientName:   "my-client",
-            RedirectURIs: []string{"http://localhost:8089/callback"},
-        },
+    // At least one registration method is required. Prefer a Client ID Metadata
+    // Document; the spec deprecates Dynamic Client Registration as of 2026-07-28.
+    ClientIDMetadataDocumentConfig: &auth.ClientIDMetadataDocumentConfig{
+        URL: "https://client.example.com/oauth/metadata.json",
     },
-    AuthorizationCodeFetcher: fetcher, // opens browser, returns code+state
+    RedirectURL:              "http://localhost:8089/callback",
+    AuthorizationCodeFetcher: fetcher, // opens browser; returns code, state, and iss
 })
 session, err := client.Connect(ctx, &mcp.StreamableClientTransport{
     Endpoint:     "https://api.example.com/mcp",
@@ -373,31 +452,13 @@ session, err := client.Connect(ctx, &mcp.StreamableClientTransport{
 }, nil)
 ```
 
-For service-to-service auth, use `extauth.NewClientCredentialsHandler` from `auth/extauth`. See `references/reference.md` for the full client OAuth surface.
+The fetcher must return the redirect's `iss` query parameter in `AuthorizationResult.Iss` (RFC 9207 mix-up defense). OAuth discovery rejects private-IP targets by default. For service-to-service auth, use `extauth.NewClientCredentialsHandler` from `auth/extauth`. See `references/reference.md` for the full client OAuth surface, token persistence, and SSRF opt-outs.
 
-### JWT Passthrough to Downstream Services
-
-Forward the caller's JWT on outbound HTTP requests using a custom `RoundTripper`:
-
-```go
-type jwtRoundTripper struct {
-    base     http.RoundTripper
-    getToken func() string
-}
-
-func (j *jwtRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
-    if token := j.getToken(); token != "" {
-        req.Header.Set("Authorization", "Bearer "+token)
-    }
-    return j.base.RoundTrip(req)
-}
-```
-
-This pattern composes with mTLS for defense-in-depth (see `references/security-labels.md`).
+To forward a caller's JWT to downstream MCP servers (row-level security, mTLS composition), see `references/security-labels.md`.
 
 ## The `_meta` Field
 
-Every `CallToolResult` has a `Meta` field (`map[string]any`) that appears as `_meta` in JSON. Use it for out-of-band metadata that the LLM does not need to reason about but consuming systems do.
+Every result and params type has a `Meta` field (`mcp.Meta`, a `map[string]any`) that appears as `_meta` in JSON. Use it for out-of-band metadata that consuming systems need but the LLM does not:
 
 ```go
 return &mcp.CallToolResult{
@@ -409,33 +470,35 @@ return &mcp.CallToolResult{
 }, nil, nil
 ```
 
-Consumers read `_meta` from the tool result without affecting the LLM's content window.
+Prefixes whose second label is `modelcontextprotocol` or `mcp` (such as `io.modelcontextprotocol/`) are reserved: on 2026-07-28 sessions the SDK writes the protocol version, client info, and capabilities into request `_meta` and `io.modelcontextprotocol/serverInfo` into result `_meta`. Use your own reverse-DNS prefix ending in `/` (e.g., `com.example.security/level`); the name after the prefix may contain only alphanumerics, `-`, `_`, and `.`. For distributed tracing, propagate W3C `traceparent`/`tracestate`/`baggage` keys in `_meta`.
 
 ## Logging
 
-Integrate with Go's `slog` to forward server logs to the connected client:
+Logging to the client is deprecated as of 2026-07-28 — prefer stderr (stdio servers) or OpenTelemetry. For legacy clients, or clients that still opt in, forward `slog` records with the request context:
 
 ```go
-logger := slog.New(mcp.NewLoggingHandler(serverSession, &mcp.LoggingHandlerOptions{}))
-logger.Info("query executed", "rows", count)
+logger := slog.New(mcp.NewLoggingHandler(req.Session, nil))
+logger.InfoContext(ctx, "query executed", "rows", count) // pass ctx: the level comes from the request
 ```
 
-Log levels follow RFC 5424: debug, info, notice, warning, error, critical, alert, emergency.
+On 2026-07-28 sessions a message is sent only if the request carried a level (`mcp.MetaKeyLogLevel` in `_meta`); `SetLoggingLevel` no longer applies.
 
 ## Design Best Practices
 
 - **Single purpose per server.** Each MCP server should have one well-defined domain.
 - **Namespace tool names.** When multiple servers may coexist, prefix tools: `inventory_search`, `orders_search`.
+- **Design for statelessness.** Return server-minted handles (IDs, cursors) as tool results and accept them as tool arguments instead of keeping per-session state.
 - **Return handles, not payloads.** For large data, return URIs to resources rather than inlining megabytes into tool results.
 - **Structured content.** Use JSON schemas for tool outputs the LLM will parse; use `TextContent` for human-readable summaries.
-- **Stdout is sacred.** Only JSON-RPC messages go to stdout. All logs and debug output go to stderr or use MCP logging notifications.
+- **Stdout is sacred.** Only JSON-RPC messages go to stdout. All logs and debug output go to stderr.
 - **Validate inputs.** Use Go struct tags and the generic `AddTool` form to get automatic schema validation. Add custom validation for business rules.
 
 ## Reference Files
 
 | File | Contents | Load when |
 |---|---|---|
-| `references/reference.md` | Complete type reference, all transport options, session management, event stores, structured output, schema customization, client-side OAuth, advanced middleware patterns, testing with in-memory transports | Looking up specific types, writing tests, or implementing advanced patterns |
-| `references/migration-from-mark3labs.md` | Step-by-step migration from `mark3labs/mcp-go` to the official SDK, with before/after code for every concept, type mapping table, and known gotchas | Migrating an existing codebase from mark3labs/mcp-go |
+| `references/protocol-2026-07-28.md` | Stateless lifecycle and discovery, per-request metadata, MRTR in depth (manual retries, load shedding, signed `RequestState`), `subscriptions/listen`, result caching, HTTP header mirroring and `x-mcp-header`, error codes, deprecations, compatibility matrix | Building for or migrating to protocol 2026-07-28, deploying stateless HTTP, or debugging version negotiation |
+| `references/reference.md` | Complete type reference, all transport options, session management, event stores, structured output, schema customization, custom JSON-RPC methods, client-side OAuth, testing with in-memory transports | Looking up specific types, writing tests, or implementing advanced patterns |
+| `references/migration-from-mark3labs.md` | Step-by-step migration from `mark3labs/mcp-go` to the official SDK, with before/after code for every concept, type mapping table, interop notes, and known gotchas | Migrating an existing codebase from mark3labs/mcp-go |
 | `references/security-labels.md` | Sensitivity metadata in `_meta`, high-water-mark rollup, mTLS configuration, JWT passthrough for RLS, sensitivity middleware | Implementing data sensitivity labeling, JWT-based row-level security, or mTLS for MCP servers |
-| `references/version-notes.md` | SDK release history v1.0.0–v1.6.1: behavior changes, new APIs per release, `MCPGODEBUG` compatibility flags, stale patterns to avoid | Working with a different SDK version, debugging version-specific behavior, or your SDK knowledge may be outdated |
+| `references/version-notes.md` | SDK release history v1.0.0–v1.8.0: behavior changes, new APIs per release, `MCPGODEBUG` compatibility flags, stale patterns to avoid | Working with a different SDK version, debugging version-specific behavior, or your SDK knowledge may be outdated |

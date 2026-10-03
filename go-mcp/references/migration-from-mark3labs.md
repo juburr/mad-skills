@@ -2,7 +2,7 @@
 
 Step-by-step guide for migrating MCP servers and clients from `github.com/mark3labs/mcp-go` to `github.com/modelcontextprotocol/go-sdk`.
 
-> Verified against SDK v1.6.1.
+> Verified against SDK v1.8.0. "Before" snippets match mark3labs/mcp-go v1.1.1 (they also apply to most v0.x releases).
 
 ## Overview of Changes
 
@@ -10,13 +10,14 @@ The official SDK is **not a fork** of mark3labs/mcp-go. It is an independent imp
 
 | Aspect | mark3labs/mcp-go | Official go-sdk |
 |---|---|---|
-| Package layout | Separate packages: `mcp`, `server`, `client`, `transport` | Single `mcp` package |
+| Package layout | Separate packages: `mcp`, `server`, `client`, `client/transport` | Single `mcp` package |
 | Schema definition | Explicit builder functions (`mcp.WithString(...)`) | Reflection from Go struct tags |
 | Tool handler args | Manual extraction (`request.RequireString("name")`) | Typed struct parameter, auto-validated |
 | Handler return | `(*CallToolResult, error)` | `(*CallToolResult, OutputType, error)` |
 | Server options | Variadic functions (`server.WithToolCapabilities()`) | Options structs (`&mcp.ServerOptions{}`) |
 | Hooks/middleware | 24+ typed hook functions | `Middleware func(MethodHandler) MethodHandler` chain |
 | Session model | Single server, per-session overlays | Distinct `Server`/`ServerSession` types, `getServer` callback |
+| Server-to-client requests | `s.RequestElicitation` / `RequestSampling` / `RequestRoots` | Return `InputRequests` from the handler (Multi Round-Trip Requests) |
 
 ## Step 1: Update Imports
 
@@ -39,9 +40,9 @@ import (
 )
 ```
 
-Install:
+Install the `mcp` package (the module root has no package, so `go get` on the bare module path leaves `go.sum` incomplete):
 ```bash
-go get github.com/modelcontextprotocol/go-sdk@v1.6.1
+go get github.com/modelcontextprotocol/go-sdk/mcp@v1.8.0
 ```
 
 ## Step 2: Migrate Server Creation
@@ -69,7 +70,7 @@ s := mcp.NewServer(
 )
 ```
 
-Capability registration (tools, resources, prompts, logging) is now automatic based on what you register. You do not explicitly declare capabilities.
+Capabilities are inferred from what you register **before** the server is connected (logging is advertised by default). A server that registers features only after connecting must declare them in `ServerOptions.Capabilities`.
 
 ## Step 3: Migrate Tool Definitions
 
@@ -102,14 +103,18 @@ s.AddTool(tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToo
 ```go
 type SearchInput struct {
     Query string `json:"query" jsonschema:"search query"`
-    Limit int    `json:"limit" jsonschema:"max results"`
+    Limit int    `json:"limit,omitempty" jsonschema:"max results"`
 }
 
 mcp.AddTool(s, &mcp.Tool{
     Name:        "search",
     Description: "Search the knowledge base.",
 }, func(ctx context.Context, req *mcp.CallToolRequest, input SearchInput) (*mcp.CallToolResult, any, error) {
-    results := doSearch(input.Query, input.Limit)
+    limit := input.Limit
+    if limit == 0 {
+        limit = 10
+    }
+    results := doSearch(input.Query, limit)
     return &mcp.CallToolResult{
         Content: []mcp.Content{&mcp.TextContent{Text: results}},
     }, nil, nil
@@ -138,7 +143,7 @@ type Input struct {
 
 ### Enum Fields
 
-Struct tags do not support enums directly. The preferred approach keeps the typed generic handler and sets `Tool.InputSchema` from `jsonschema.For[T]` with `jsonschema.ForOptions{TypeSchemas: ...}` — see "Schema Customization" in `reference.md`. Alternatively, define the schema manually with the low-level `AddTool` method:
+Struct tags do not support enums directly. The preferred approach keeps the typed generic handler and sets `Tool.InputSchema` from `jsonschema.For[T]` with `jsonschema.ForOptions{TypeSchemas: ...}` (see "Schema Customization" in the reference file). Alternatively, define the schema manually with the low-level `AddTool` method:
 
 **Before:**
 ```go
@@ -197,7 +202,7 @@ This is useful as an intermediate migration step before converting to typed inpu
 // Convenience constructors
 return mcp.NewToolResultText("hello"), nil
 return mcp.NewToolResultError("not found"), nil
-return mcp.NewToolResultImage(data, "image/png"), nil
+return mcp.NewToolResultImage("chart", base64PNG, "image/png"), nil // data is a base64 string
 ```
 
 **After:**
@@ -213,9 +218,12 @@ return &mcp.CallToolResult{
     Content: []mcp.Content{&mcp.TextContent{Text: "not found"}},
 }, nil, nil
 
-// Image result
+// Image result: Data is raw bytes; the SDK base64-encodes on the wire
 return &mcp.CallToolResult{
-    Content: []mcp.Content{&mcp.ImageContent{Data: data, MIMEType: "image/png"}},
+    Content: []mcp.Content{
+        &mcp.TextContent{Text: "chart"},
+        &mcp.ImageContent{Data: pngBytes, MIMEType: "image/png"},
+    },
 }, nil, nil
 ```
 
@@ -296,8 +304,9 @@ s.AddResource(&mcp.Resource{
 Key differences:
 - Resource struct replaces builder functions
 - Handler returns `*ReadResourceResult` (wrapper struct) instead of `[]ResourceContents`
-- `ResourceContents` is a single type with `Text` and `Blob` fields, replacing `TextResourceContents` and `BlobResourceContents`
+- `ResourceContents` is a single type with `Text` and `Blob` fields, replacing `TextResourceContents` and `BlobResourceContents`; `Blob` is raw bytes, not base64
 - `req` is a pointer
+- Return `mcp.ResourceNotFoundError(uri)` for unknown URIs (wire code `-32602`)
 
 ### Resource Templates
 
@@ -399,11 +408,52 @@ if err := s.Run(ctx, &mcp.StdioTransport{}); err != nil {
 }
 ```
 
+### Streamable HTTP Server
+
+**Before:**
+```go
+httpServer := server.NewStreamableHTTPServer(s,
+    server.WithEndpointPath("/mcp"),
+    server.WithStateLess(true),
+    server.WithHTTPContextFunc(func(ctx context.Context, r *http.Request) context.Context {
+        return withTenant(ctx, r.Header.Get("X-Tenant-ID"))
+    }),
+)
+http.ListenAndServe(":8080", httpServer)
+```
+
+**After:**
+```go
+// Replaces WithHTTPContextFunc: rebuild the handler context from each request,
+// so existing tool handlers that read the tenant from ctx keep working.
+s.AddReceivingMiddleware(func(next mcp.MethodHandler) mcp.MethodHandler {
+    return func(ctx context.Context, method string, req mcp.Request) (mcp.Result, error) {
+        if extra := req.GetExtra(); extra != nil && extra.Header != nil { // nil on stdio/in-memory
+            ctx = withTenant(ctx, extra.Header.Get("X-Tenant-ID"))
+        }
+        return next(ctx, method, req)
+    }
+})
+
+handler := mcp.NewStreamableHTTPHandler(
+    func(req *http.Request) *mcp.Server { return s },
+    &mcp.StreamableHTTPOptions{Stateless: true},
+)
+http.Handle("/mcp", handler)
+http.ListenAndServe(":8080", nil)
+```
+
+- Use a receiving middleware, not an HTTP middleware that calls `r.WithContext(...)`, to replace a context function. `req.GetExtra()` (`Header`, `TokenInfo`) is populated for every request, whereas on a *stateful* handler the tool handler's `ctx` carries the values of the request that created the session, so per-request values set by HTTP middleware go stale.
+- The example keeps the original header-based tenant to stay behavior-compatible. A client-supplied header is not an identity: in production derive the tenant from the verified token (`extra.TokenInfo`, set by `auth.RequireBearerToken`) and reject requests without one.
+- The `getServer` callback also receives the HTTP request, enabling per-request server instances (e.g., a tool set per tenant).
+- Set `Stateless: true` for new deployments — it is the only mode that serves protocol 2026-07-28. A stateful handler (the default) still serves 2025-11-25 and older clients; use it only if you depend on session IDs or legacy server-to-client requests.
+
 ### SSE Server
 
 **Before:**
 ```go
-sseServer := server.NewSSEServer(s, "/mcp",
+sseServer := server.NewSSEServer(s,
+    server.WithBasePath("/mcp"),
     server.WithSSEContextFunc(func(ctx context.Context, r *http.Request) context.Context {
         return ctx
     }),
@@ -420,31 +470,7 @@ handler := mcp.NewSSEHandler(
 http.ListenAndServe(":8080", handler)
 ```
 
-### Streamable HTTP Server
-
-**Before:**
-```go
-httpServer := server.NewStreamableHTTPServer(s, "/mcp",
-    server.WithStreamableHTTPContextFunc(func(ctx context.Context, r *http.Request) context.Context {
-        return ctx
-    }),
-)
-http.ListenAndServe(":8080", httpServer)
-```
-
-**After:**
-```go
-handler := mcp.NewStreamableHTTPHandler(
-    func(req *http.Request) *mcp.Server { return s },
-    &mcp.StreamableHTTPOptions{
-        SessionTimeout: 30 * time.Minute,
-    },
-)
-http.Handle("/mcp", handler)
-http.ListenAndServe(":8080", nil)
-```
-
-The `getServer` callback replaces context functions. It receives the HTTP request and returns a `*Server`, enabling per-request server instances for multi-tenant deployments.
+The SSE transport is deprecated; migrate SSE servers to Streamable HTTP unless a legacy client requires SSE.
 
 ### Client Transports
 
@@ -461,7 +487,7 @@ t, _ := transport.NewStreamableHTTP("http://localhost:8080/mcp")
 
 c := client.NewClient(t)
 if err := c.Start(ctx); err != nil { log.Fatal(err) }
-if err := c.Initialize(ctx, initRequest); err != nil { log.Fatal(err) }
+if _, err := c.Initialize(ctx, initRequest); err != nil { log.Fatal(err) }
 ```
 
 **After:**
@@ -487,7 +513,7 @@ session, err := c.Connect(ctx, &mcp.StreamableClientTransport{
 }, nil)
 ```
 
-`Connect` handles initialization automatically. No separate `Start` + `Initialize` calls.
+`Connect` handles discovery and initialization automatically. No separate `Start` + `Initialize` calls.
 
 ## Step 8: Migrate Hooks to Middleware
 
@@ -519,29 +545,28 @@ s := mcp.NewServer(
 s.AddReceivingMiddleware(func(next mcp.MethodHandler) mcp.MethodHandler {
     return func(ctx context.Context, method string, req mcp.Request) (mcp.Result, error) {
         slog.Info("received", "method", method)
-        return next(ctx, method, req)
-    }
-})
-
-s.AddSendingMiddleware(func(next mcp.MethodHandler) mcp.MethodHandler {
-    return func(ctx context.Context, method string, req mcp.Request) (mcp.Result, error) {
-        slog.Info("sending", "method", method)
-        return next(ctx, method, req)
+        res, err := next(ctx, method, req)
+        if err != nil {
+            slog.Error("failed", "method", method, "err", err)
+        }
+        return res, err
     }
 })
 ```
 
-For method-specific logic, switch on the `method` string:
+For method-specific logic, switch on the `method` string and type-assert the request:
 ```go
 s.AddReceivingMiddleware(func(next mcp.MethodHandler) mcp.MethodHandler {
     return func(ctx context.Context, method string, req mcp.Request) (mcp.Result, error) {
-        if method == "tools/call" {
-            slog.Info("calling tool")
+        if call, ok := req.(*mcp.CallToolRequest); ok {
+            slog.Info("calling tool", "name", call.Params.Name)
         }
         return next(ctx, method, req)
     }
 })
 ```
+
+`AddSendingMiddleware` wraps messages the server sends (notifications, legacy server-to-client requests).
 
 ## Step 9: Migrate Notifications
 
@@ -551,7 +576,7 @@ s.AddReceivingMiddleware(func(next mcp.MethodHandler) mcp.MethodHandler {
 s.SendNotificationToAllClients("notifications/tools/list_changed", nil)
 
 // Session-specific
-s.SendNotificationToSession(sessionID, method, params)
+s.SendNotificationToSpecificClient(sessionID, method, params)
 ```
 
 **After:**
@@ -565,7 +590,59 @@ s.ResourceUpdated(ctx, &mcp.ResourceUpdatedNotificationParams{
 })
 ```
 
-## Step 10: Migrate Client Usage
+For progress on a specific request, use `req.Session.NotifyProgress` inside the handler. There is no API for arbitrary notifications to a session ID.
+
+## Step 10: Migrate Server-to-Client Requests
+
+mark3labs servers call the client mid-handler. The official SDK uses Multi Round-Trip Requests: return the request, and the handler runs again with the answer. This works for every client over stdio, in-memory, and stateful HTTP. Over `Stateless: true` HTTP it works only for 2026-07-28 clients: the SDK serves older clients through a shim that needs server-to-client calls, so their call fails.
+
+**Before:**
+```go
+s.AddTool(tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+    res, err := s.RequestElicitation(ctx, mcp.ElicitationRequest{
+        Params: mcp.ElicitationParams{
+            Message:         "Proceed?",
+            RequestedSchema: confirmSchema,
+        },
+    })
+    if err != nil {
+        return nil, err
+    }
+    if res.Action != mcp.ElicitationResponseActionAccept {
+        return mcp.NewToolResultText("cancelled"), nil
+    }
+    return mcp.NewToolResultText(doWork()), nil
+})
+```
+
+**After:**
+```go
+mcp.AddTool(s, &mcp.Tool{Name: "work"}, func(ctx context.Context, req *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, any, error) {
+    res, answered := req.Params.InputResponses["proceed"].(*mcp.ElicitResult)
+    if !answered {
+        // Form elicitation needs a client that declared it; URL-only clients cannot render forms.
+        caps := req.ClientCapabilities()
+        if caps == nil || caps.Elicitation == nil || (caps.Elicitation.Form == nil && caps.Elicitation.URL != nil) {
+            return nil, nil, fmt.Errorf("client cannot confirm; refusing to proceed")
+        }
+        return &mcp.CallToolResult{
+            InputRequests: mcp.InputRequestMap{
+                "proceed": &mcp.ElicitParams{Message: "Proceed?", RequestedSchema: confirmSchema},
+            },
+        }, nil, nil
+    }
+    if res.Action != "accept" {
+        return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "cancelled"}}}, nil, nil
+    }
+    return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: doWork()}}}, nil, nil
+})
+```
+
+This tool takes no arguments. When the confirmed action depends on arguments or on the caller, also bind the answer to them with a signed `RequestState` (the `deleteRepo` example in SKILL.md): the client sends both rounds, so otherwise a retry can carry an answer onto different arguments.
+
+`RequestSampling` maps to `&mcp.CreateMessageParams{...}` (answered with `*mcp.CreateMessageWithToolsResult`) and `RequestRoots` to `&mcp.ListRootsParams{}` (answered with `*mcp.ListRootsResult`); both features are deprecated in the 2026-07-28 spec. Calling `req.Session.Elicit` directly also compiles but fails on 2026-07-28 sessions.
+
+## Step 11: Migrate Client Usage
 
 **Before:**
 ```go
@@ -598,6 +675,9 @@ c := mcp.NewClient(
         ToolListChangedHandler: func(ctx context.Context, req *mcp.ToolListChangedRequest) {
             // tool list changed
         },
+        ElicitationHandler: func(ctx context.Context, req *mcp.ElicitRequest) (*mcp.ElicitResult, error) {
+            return askUser(req.Params) // answers server input requests
+        },
     },
 )
 session, err := c.Connect(ctx, transport, nil)
@@ -618,10 +698,10 @@ for tool, err := range session.Tools(ctx, nil) {
 Key differences:
 - `Connect` replaces `Start` + `Initialize`
 - Methods are on `*ClientSession`, not `*Client`
-- Notification handlers are set via `ClientOptions`, not callback registration
+- Notification and request handlers are set via `ClientOptions`, not callback registration
 - Auto-paginating iterators (`session.Tools(ctx, nil)`) replace manual list calls
 
-## Step 11: Migrate Argument Parsing
+## Step 12: Migrate Argument Parsing
 
 If migrating incrementally and not yet using typed input structs, translate manual argument parsing:
 
@@ -667,7 +747,7 @@ func handler(ctx context.Context, req *mcp.CallToolRequest, input Input) (*mcp.C
 }
 ```
 
-## Step 12: Migrate Session Context
+## Step 13: Migrate Session Context
 
 **Before:**
 ```go
@@ -677,11 +757,19 @@ session := server.ClientSessionFromContext(ctx)
 
 **After:**
 ```go
-// ServerSession is passed directly to middleware
-// or available via the getServer callback's HTTP request
+func handler(ctx context.Context, req *mcp.CallToolRequest, in Input) (*mcp.CallToolResult, any, error) {
+    ss := req.Session          // *mcp.ServerSession
+    caller := req.ClientInfo() // client name/version
+    if req.Extra != nil {      // nil on stdio and in-memory transports
+        token := req.Extra.TokenInfo // from auth.RequireBearerToken; may be nil
+        tenant := req.Extra.Header.Get("X-Tenant-ID")
+        // ...
+    }
+    // ...
+}
 ```
 
-Session access patterns differ significantly. In the official SDK, the `getServer` callback on HTTP handlers receives the `*http.Request`, enabling per-request context injection. Tool handlers receive context enriched by middleware.
+Over stateless HTTP each request has its own temporary `ServerSession` (`ss.ID()` is `""`), so do not key long-lived state on the session; pass server-minted handles as tool arguments instead.
 
 ## Quick Reference: Type Mapping
 
@@ -698,13 +786,28 @@ Session access patterns differ significantly. In the official SDK, the `getServe
 | `mcp.NewToolResultText(s)` | `&mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: s}}}` |
 | `mcp.NewToolResultError(s)` | `&mcp.CallToolResult{IsError: true, Content: []mcp.Content{&mcp.TextContent{Text: s}}}` |
 | `server.Hooks{}` | `s.AddReceivingMiddleware(...)` / `s.AddSendingMiddleware(...)` |
+| `s.RequestElicitation(ctx, req)` | Return `InputRequests: mcp.InputRequestMap{"id": &mcp.ElicitParams{...}}` |
+| `server.ClientSessionFromContext(ctx)` | `req.Session` |
 | `client.NewClient(transport)` | `mcp.NewClient(impl, opts)` then `client.Connect(ctx, transport, nil)` |
-| `server.NewStdioServer(s)` | `s.Run(ctx, &mcp.StdioTransport{})` |
-| `server.NewSSEServer(s, path, opts...)` | `mcp.NewSSEHandler(getServer, opts)` |
-| `server.NewStreamableHTTPServer(s, path, opts...)` | `mcp.NewStreamableHTTPHandler(getServer, opts)` |
+| `server.NewStdioServer(s)` / `server.ServeStdio(s)` | `s.Run(ctx, &mcp.StdioTransport{})` |
+| `server.NewSSEServer(s, opts...)` | `mcp.NewSSEHandler(getServer, opts)` |
+| `server.NewStreamableHTTPServer(s, opts...)` | `mcp.NewStreamableHTTPHandler(getServer, &mcp.StreamableHTTPOptions{Stateless: true})` |
 | `transport.NewStdio(cmd, env, args...)` | `&mcp.CommandTransport{Command: exec.Command(cmd, args...)}` |
 | `transport.NewSSE(url)` | `&mcp.SSEClientTransport{Endpoint: url}` |
 | `transport.NewStreamableHTTP(url)` | `&mcp.StreamableClientTransport{Endpoint: url}` |
+
+## Interoperability During Migration
+
+Both libraries speak protocol 2026-07-28 and fall back to older versions, so mixed fleets work — with one exception. Observed with SDK v1.8.0 and mark3labs/mcp-go v1.1.1:
+
+| Client → Server | Result |
+|---|---|
+| Official client → mark3labs server (stdio or Streamable HTTP) | Works (2026-07-28) |
+| mark3labs client → official server (stdio) | Works (2026-07-28) |
+| mark3labs client → official Streamable HTTP, `Stateless: true` | Works (2026-07-28) |
+| mark3labs client → official Streamable HTTP, stateful | **Fails on the first call**: the mark3labs client ignores the server's `supportedVersions` and keeps using 2026-07-28. Fix server-side with `Stateless: true`, or client-side with `client.WithLegacyProtocolOnly()` |
+
+Legacy SSE transport edge case: mark3labs returns JSON-RPC-formatted errors on the HTTP POST endpoint while the official SDK returns plain text. The 2024-11-05 SSE spec does not specify POST error formatting, so neither is wrong, but clients that parse POST error bodies as JSON-RPC may misreport errors.
 
 ## Known Gotchas
 
@@ -714,18 +817,22 @@ Session access patterns differ significantly. In the official SDK, the `getServe
 
 3. **No convenience constructors.** `NewToolResultText`, `NewToolResultError`, `NewToolResultImage` do not exist. Build `CallToolResult` structs directly.
 
-4. **Enum support.** Struct-tag-based schema generation does not support enums. Set `Tool.InputSchema` explicitly — either via `jsonschema.For[T]` with `ForOptions{TypeSchemas: ...}` (keeps the typed handler) or a manual schema with the low-level `AddTool` method.
+4. **Binary data is raw bytes.** mark3labs carries base64 strings in image, audio, and blob fields; the official SDK uses `[]byte` and encodes on the wire. Decode existing base64 before assigning it, or clients receive double-encoded data.
 
-5. **`req` is a pointer.** All request types (`*CallToolRequest`, `*ReadResourceRequest`, etc.) are pointers in handler signatures. mark3labs uses value types.
+5. **Enum support.** Struct-tag-based schema generation does not support enums. Set `Tool.InputSchema` explicitly — either via `jsonschema.For[T]` with `ForOptions{TypeSchemas: ...}` (keeps the typed handler) or a manual schema with the low-level `AddTool` method.
 
-6. **Auto-initialization.** `client.Connect` handles the initialize handshake. Do not call a separate `Initialize` method.
+6. **`req` is a pointer.** All request types (`*CallToolRequest`, `*ReadResourceRequest`, etc.) are pointers in handler signatures. mark3labs uses value types.
 
-7. **Automatic capability advertisement.** Capabilities are inferred from registered features. Do not manually declare `WithToolCapabilities()` etc.
+7. **Auto-initialization.** `client.Connect` handles discovery and the initialize handshake. Do not call a separate `Initialize` method.
 
-8. **`Arguments` is `json.RawMessage`.** In `CallToolRequest.Params`, `Arguments` is `json.RawMessage`, not `map[string]any`. The generic handler auto-unmarshals this, but low-level handlers must unmarshal manually.
+8. **Automatic capability advertisement.** Capabilities are inferred from features registered before connecting. Do not manually declare `WithToolCapabilities()` etc.
 
-9. **`Content` vs `TextContent`.** In mark3labs, `TextContent` has a `Type: "text"` field you must set. In the official SDK, omit the `Type` field — it is set automatically during serialization.
+9. **`Arguments` is `json.RawMessage`.** In `CallToolRequest.Params`, `Arguments` is `json.RawMessage`, not `map[string]any`. The generic handler auto-unmarshals this, but low-level handlers must unmarshal manually.
 
-10. **Middleware ordering.** `AddReceivingMiddleware(m1, m2, m3)` executes m1 first (outermost). This is standard middleware wrapping: `m1(m2(m3(handler)))`.
+10. **`Content` vs `TextContent`.** In mark3labs, `TextContent` has a `Type: "text"` field you must set. In the official SDK, omit the `Type` field — it is set automatically during serialization.
 
-11. **Typed handler errors become tool errors.** When using the generic `AddTool` path, returning a regular Go error wraps it into a `CallToolResult` with `IsError: true`. The error message is visible to the LLM. Only `*jsonrpc.Error` is treated as a protocol-level error.
+11. **Middleware ordering.** `AddReceivingMiddleware(m1, m2, m3)` executes m1 first (outermost). This is standard middleware wrapping: `m1(m2(m3(handler)))`.
+
+12. **Typed handler errors become tool errors.** When using the generic `AddTool` path, returning a regular Go error wraps it into a `CallToolResult` with `IsError: true`. The error message is visible to the LLM. Only `*jsonrpc.Error` is treated as a protocol-level error.
+
+13. **No mid-handler client calls.** Replace `RequestElicitation`/`RequestSampling`/`RequestRoots` with `InputRequests`; the handler must be safe to run more than once per logical call.

@@ -620,6 +620,11 @@ s.AddTool(tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToo
 mcp.AddTool(s, &mcp.Tool{Name: "work"}, func(ctx context.Context, req *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, any, error) {
     res, answered := req.Params.InputResponses["proceed"].(*mcp.ElicitResult)
     if !answered {
+        // Form elicitation needs a client that declared it; URL-only clients cannot render forms.
+        caps := req.ClientCapabilities()
+        if caps == nil || caps.Elicitation == nil || (caps.Elicitation.Form == nil && caps.Elicitation.URL != nil) {
+            return nil, nil, fmt.Errorf("client cannot confirm; refusing to proceed")
+        }
         return &mcp.CallToolResult{
             InputRequests: mcp.InputRequestMap{
                 "proceed": &mcp.ElicitParams{Message: "Proceed?", RequestedSchema: confirmSchema},

@@ -239,6 +239,8 @@ session, _ := client.Connect(ctx, &mcp.StreamableClientTransport{
 }, nil)
 ```
 
+Bind each session to one caller. A session's list and `resources/read` results are cached client-side for the server's `ttlMs`, regardless of which token was sent, so switching `currentUserJWT` on a shared session can return another user's data (see "Cache Scope for Access-Controlled Data" below).
+
 ### Server-Side RLS
 
 On the MCP server, extract the JWT from the request, validate it, and use claims for database queries:
@@ -265,19 +267,20 @@ Fail closed: a missing token or claim must never fall through to an unscoped que
 
 ### Cache Scope for Access-Controlled Data
 
-Under protocol 2026-07-28, list results and `resources/read` results carry `ttlMs` and `cacheScope`, and the SDK defaults `cacheScope` to `"public"` — meaning shared intermediaries may cache and serve the response to other users. Mark anything filtered by the caller's identity as `"private"`:
+Under protocol 2026-07-28, list results and `resources/read` results carry `ttlMs` and `cacheScope`, and the SDK defaults `cacheScope` to `"public"` — meaning shared intermediaries may cache and serve the response to other users. For anything filtered by the caller's identity, mark it `"private"` **and** keep `ttlMs` at `0`:
 
 ```go
 server := mcp.NewServer(impl, &mcp.ServerOptions{
     SetCacheable: func(_ context.Context, req mcp.Request, c *mcp.Cacheable) {
         if extra := req.GetExtra(); extra != nil && extra.TokenInfo != nil {
             c.CacheScope = "private"
+            c.TTLMs = 0 // the Go client caches per session, not per caller
         }
     },
 })
 ```
 
-Keep `ttlMs` at `0` (the default) for results whose sensitivity labels can change.
+`"private"` alone does not isolate callers. The Go SDK client caches list and `resources/read` results per `ClientSession`, keyed only by cursor or URI. An agent that reuses one session while rotating the bearer token (as in the passthrough example above) will serve user A's cached result to user B for the whole TTL. Keep identity-filtered results at `ttlMs: 0` on the server, and on the client use one `ClientSession` per principal.
 
 ### Alternative: JWT in `_meta`
 

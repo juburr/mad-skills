@@ -319,7 +319,7 @@ for resource, err := range session.Resources(ctx, nil) { /* ... */ }
 for prompt, err := range session.Prompts(ctx, nil) { /* ... */ }
 ```
 
-On 2026-07-28 sessions the client caches list and `resources/read` results for the server-provided `ttlMs`; list-changed and resource-updated notifications invalidate the cache.
+On 2026-07-28 sessions the client caches list and `resources/read` results for the server-provided `ttlMs`; list-changed and resource-updated notifications invalidate the cache. The cache belongs to the session, not the caller, so never share one session across users.
 
 ## Error Handling
 

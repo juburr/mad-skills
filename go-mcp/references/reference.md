@@ -427,9 +427,13 @@ client := mcp.NewClient(impl, &mcp.ClientOptions{
 })
 ```
 
-Server-side, return an input request from the handler (works on every protocol version; see SKILL.md):
+Server-side, return an input request from the handler (works on every protocol version; see SKILL.md). Check first that the client can render a form — URL-only clients cannot, and older clients send `elicitation: {}` (nil `Form` and `URL`) to mean form support:
 
 ```go
+caps := req.ClientCapabilities()
+if caps == nil || caps.Elicitation == nil || (caps.Elicitation.Form == nil && caps.Elicitation.URL != nil) {
+    return nil, nil, fmt.Errorf("client cannot confirm the operation")
+}
 return &mcp.CallToolResult{
     InputRequests: mcp.InputRequestMap{
         "confirm": &mcp.ElicitParams{Message: "Please confirm the operation", RequestedSchema: schema},
@@ -455,7 +459,7 @@ client := mcp.NewClient(impl, &mcp.ClientOptions{
 })
 ```
 
-A server requesting sampling via `InputRequests` (`*mcp.CreateMessageParams`) always receives a `*mcp.CreateMessageWithToolsResult` (array `Content`) on the retry.
+A server may request sampling via `InputRequests` (`*mcp.CreateMessageParams`) only if `req.ClientCapabilities().Sampling` is non-nil; the retry always carries a `*mcp.CreateMessageWithToolsResult` (array `Content`).
 
 ### Roots (Deprecated)
 
@@ -464,7 +468,7 @@ client.AddRoots(&mcp.Root{URI: "file:///workspace", Name: "Project Root"})
 client.RemoveRoots("file:///workspace")
 ```
 
-Servers request roots with `&mcp.ListRootsParams{}` in `InputRequests` and receive `*mcp.ListRootsResult`. Prefer taking paths as tool arguments.
+Servers request roots with `&mcp.ListRootsParams{}` in `InputRequests` (only if the client declared roots) and receive `*mcp.ListRootsResult`. Prefer taking paths as tool arguments.
 
 ### Completion
 

@@ -427,7 +427,7 @@ client := mcp.NewClient(impl, &mcp.ClientOptions{
 })
 ```
 
-Server-side, return an input request from the handler (works on every protocol version; see SKILL.md). Check first that the client can render a form — URL-only clients cannot, and older clients send `elicitation: {}` (nil `Form` and `URL`) to mean form support:
+Server-side, return an input request from the handler (see SKILL.md). This works for every client over stdio, in-memory, and stateful HTTP. Over `Stateless: true` HTTP it works only for 2026-07-28 clients: the SDK serves legacy (≤ 2025-11-25) clients through a shim that needs server-to-client calls, so their call fails. Check first that the client can render a form — URL-only clients cannot, and older clients send `elicitation: {}` (nil `Form` and `URL`) to mean form support:
 
 ```go
 caps := req.ClientCapabilities()

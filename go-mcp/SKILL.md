@@ -137,12 +137,7 @@ server.AddPrompt(&mcp.Prompt{
 
 ### Removing Features at Runtime
 
-```go
-server.RemoveTools("old-tool")
-server.RemoveResources("config://app/deprecated")
-server.RemovePrompts("old-prompt")
-server.RemoveResourceTemplates("file:///old/{path}")
-```
+Call `server.RemoveTools("old-tool")`, `RemoveResources(uri)`, `RemovePrompts(name)`, or `RemoveResourceTemplates(uriTemplate)`; each takes any number of arguments.
 
 ## Asking the Client for Input
 
@@ -152,11 +147,18 @@ Use **Multi Round-Trip Requests** (MRTR) to ask for user confirmation (elicitati
 import "github.com/google/jsonschema-go/jsonschema"
 
 func deleteRepo(ctx context.Context, req *mcp.CallToolRequest, in DeleteInput) (*mcp.CallToolResult, any, error) {
+    // Bind the answer to this caller and repo (helpers: references/protocol-2026-07-28.md).
+    bind := pendingState{Subject: callerID(req), Tool: "delete_repo", ArgsSum: in.Repo}
     answer, answered := req.Params.InputResponses["confirm"].(*mcp.ElicitResult)
     if !answered {
         caps := req.ClientCapabilities() // URL-only clients cannot render forms
         if caps == nil || caps.Elicitation == nil || (caps.Elicitation.Form == nil && caps.Elicitation.URL != nil) {
             return nil, nil, fmt.Errorf("client cannot confirm deletion; refusing")
+        }
+        bind.Expires = time.Now().Add(5 * time.Minute)
+        state, err := sealState(stateKey, bind)
+        if err != nil {
+            return nil, nil, err
         }
         return &mcp.CallToolResult{
             InputRequests: mcp.InputRequestMap{
@@ -168,7 +170,11 @@ func deleteRepo(ctx context.Context, req *mcp.CallToolRequest, in DeleteInput) (
                     },
                 },
             },
+            RequestState: state,
         }, nil, nil
+    }
+    if _, err := openState(stateKey, req.Params.RequestState, bind.Subject, bind.Tool, bind.ArgsSum); err != nil {
+        return nil, nil, fmt.Errorf("confirmation does not match this request: %w", err) // e.g., arguments changed
     }
     if answer.Action != "accept" || answer.Content["confirm"] != true {
         return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "Cancelled."}}}, nil, nil
@@ -186,7 +192,7 @@ func deleteRepo(ctx context.Context, req *mcp.CallToolRequest, in DeleteInput) (
 - MRTR works on `tools/call`, `prompts/get`, and `resources/read`; `GetPromptResult` and `ReadResourceResult` carry the same `InputRequests`/`RequestState` fields.
 - While requesting input, leave every content field empty — `Content`, `StructuredContent`, prompt `Messages`, resource `Contents` — or the SDK rejects it as a server bug (`-32603`). (`AddTool` discards a typed handler's output on that round.)
 - Only request what the client declared (check `req.ClientCapabilities()`). Older clients send `elicitation: {}` (nil `Form` and `URL`) to mean form support.
-- The retry is a new, independent request; over stateless HTTP another instance may serve it. Carry progress in `RequestState`, not in memory, and treat it as attacker-controlled: integrity-protect it (HMAC or AEAD) and bind it to the caller and a short expiry.
+- The retry is a new, independent request; over stateless HTTP another instance may serve it. Carry progress in `RequestState`, not in memory, and treat it and `InputResponses` as attacker-controlled: integrity-protect the state (HMAC or AEAD) and bind it to the caller, the salient arguments, and a short expiry, as above, so an answer cannot be replayed onto different arguments.
 - Legacy (≤ 2025-11-25) clients still work: the SDK fulfils the requests itself with server-to-client calls and re-invokes the handler once, so collect all input in one round for them. That needs a bidirectional session (stdio, in-memory, stateful HTTP) — it fails for legacy clients over stateless HTTP.
 
 Do **not** call `req.Session.Elicit` / `CreateMessage` / `ListRoots` in new code: they return an error on 2026-07-28 sessions. See `references/protocol-2026-07-28.md` for manual retry handling, load shedding, and a `RequestState` signing example.
@@ -355,11 +361,7 @@ return nil, nil, &jsonrpc.Error{Code: jsonrpc.CodeInternalError, Message: "inter
 
 ### Resource Not Found
 
-```go
-return nil, mcp.ResourceNotFoundError(uri)
-```
-
-The wire code is `-32602` (Invalid Params) since v1.7.0; it was `-32002` before. Update any client that matches on `-32002`.
+Return `nil, mcp.ResourceNotFoundError(uri)` from the resource handler. The wire code is `-32602` (Invalid Params) since v1.7.0; it was `-32002` before. Update any client that matches on `-32002`.
 
 ## Middleware
 

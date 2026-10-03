@@ -594,7 +594,7 @@ For progress on a specific request, use `req.Session.NotifyProgress` inside the 
 
 ## Step 10: Migrate Server-to-Client Requests
 
-mark3labs servers call the client mid-handler. The official SDK uses Multi Round-Trip Requests: return the request, and the handler runs again with the answer. This works for clients on every protocol version (the SDK shims older clients over bidirectional transports).
+mark3labs servers call the client mid-handler. The official SDK uses Multi Round-Trip Requests: return the request, and the handler runs again with the answer. This works for every client over stdio, in-memory, and stateful HTTP. Over `Stateless: true` HTTP it works only for 2026-07-28 clients: the SDK serves older clients through a shim that needs server-to-client calls, so their call fails.
 
 **Before:**
 ```go
@@ -637,6 +637,8 @@ mcp.AddTool(s, &mcp.Tool{Name: "work"}, func(ctx context.Context, req *mcp.CallT
     return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: doWork()}}}, nil, nil
 })
 ```
+
+This tool takes no arguments. When the confirmed action depends on arguments or on the caller, also bind the answer to them with a signed `RequestState` (the `deleteRepo` example in SKILL.md): the client sends both rounds, so otherwise a retry can carry an answer onto different arguments.
 
 `RequestSampling` maps to `&mcp.CreateMessageParams{...}` (answered with `*mcp.CreateMessageWithToolsResult`) and `RequestRoots` to `&mcp.ListRootsParams{}` (answered with `*mcp.ListRootsResult`); both features are deprecated in the 2026-07-28 spec. Calling `req.Session.Elicit` directly also compiles but fails on 2026-07-28 sessions.
 

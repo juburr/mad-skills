@@ -267,14 +267,19 @@ Fail closed: a missing token or claim must never fall through to an unscoped que
 
 ### Cache Scope for Access-Controlled Data
 
-Under protocol 2026-07-28, list results and `resources/read` results carry `ttlMs` and `cacheScope`, and the SDK defaults `cacheScope` to `"public"` — meaning shared intermediaries may cache and serve the response to other users. For anything filtered by the caller's identity, mark it `"private"` **and** keep `ttlMs` at `0`:
+Under protocol 2026-07-28, list results and `resources/read` results carry `ttlMs` and `cacheScope`, and the SDK defaults `cacheScope` to `"public"` — meaning shared intermediaries may cache and serve the response to other users. Default every result to `"private"` with `ttlMs: 0`, and opt known identity-independent results into public caching explicitly. Don't infer cache safety from `TokenInfo`: callers authenticated by mTLS, a cookie, `_meta`, or a custom header have no `TokenInfo`, yet their results are just as access-controlled.
 
 ```go
 server := mcp.NewServer(impl, &mcp.ServerOptions{
     SetCacheable: func(_ context.Context, req mcp.Request, c *mcp.Cacheable) {
-        if extra := req.GetExtra(); extra != nil && extra.TokenInfo != nil {
-            c.CacheScope = "private"
-            c.TTLMs = 0 // the Go client caches per session, not per caller
+        switch req.(type) {
+        case *mcp.ListToolsRequest, *mcp.ListPromptsRequest:
+            // Opt in only results identical for every caller (here: a static
+            // tool/prompt catalog; not true if tool sets vary per tenant).
+            c.TTLMs, c.CacheScope = 300_000, "public"
+        default:
+            // Access-controlled by default, however the caller authenticated.
+            c.TTLMs, c.CacheScope = 0, "private" // the Go client caches per session, not per caller
         }
     },
 })

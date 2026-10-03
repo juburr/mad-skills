@@ -441,7 +441,7 @@ return &mcp.CallToolResult{
 }, nil, nil
 ```
 
-`RequestedSchema` is a flat object of primitive fields. `Default` values are applied when the user accepts without supplying a field (unless the field is also `Required`); `Enum` is allowed only on `"string"` fields.
+`RequestedSchema` is a flat object (no nested objects). Each property is one of: a `"string"` (optional `format` `email`/`uri`/`date`/`date-time`, or a single-select enum via `Enum` or titled `OneOf` entries of `{Const, Title}`), a `"number"`/`"integer"`, a `"boolean"`, or a multi-select `"array"` whose `Items` is a string `Enum` or titled `AnyOf` entries. `Default` values are applied when the user accepts without supplying a field (unless the field is also `Required`); `Enum` is allowed only on string fields.
 
 ### Sampling (Deprecated)
 
@@ -459,7 +459,7 @@ client := mcp.NewClient(impl, &mcp.ClientOptions{
 })
 ```
 
-A server may request sampling via `InputRequests` (`*mcp.CreateMessageParams`) only if `req.ClientCapabilities().Sampling` is non-nil; the retry always carries a `*mcp.CreateMessageWithToolsResult` (array `Content`).
+A server may request sampling via `InputRequests` (`*mcp.CreateMessageParams`) only if `req.ClientCapabilities().Sampling` is non-nil; tool-enabled sampling (`*mcp.CreateMessageWithToolsParams` with `Tools`) also requires `Sampling.Tools`, because a client with only a basic `CreateMessageHandler` receives a down-converted request without `Tools` or `ToolChoice`. The retry always carries a `*mcp.CreateMessageWithToolsResult` (array `Content`).
 
 ### Roots (Deprecated)
 

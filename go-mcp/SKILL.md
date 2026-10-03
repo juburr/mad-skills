@@ -184,7 +184,7 @@ func deleteRepo(ctx context.Context, req *mcp.CallToolRequest, in DeleteInput) (
 | `*mcp.ListRootsParams` | `*mcp.ListRootsResult` |
 
 - MRTR works on `tools/call`, `prompts/get`, and `resources/read`; `GetPromptResult` and `ReadResourceResult` carry the same `InputRequests`/`RequestState` fields.
-- Never set both `InputRequests` and `Content` — the SDK rejects that as a server bug (`-32603`).
+- While requesting input, leave every content field empty — `Content`, `StructuredContent`, prompt `Messages`, resource `Contents` — or the SDK rejects it as a server bug (`-32603`). (`AddTool` discards a typed handler's output on that round.)
 - Only request what the client declared (check `req.ClientCapabilities()`). Older clients send `elicitation: {}` (nil `Form` and `URL`) to mean form support.
 - The retry is a new, independent request; over stateless HTTP another instance may serve it. Carry progress in `RequestState`, not in memory, and treat it as attacker-controlled: integrity-protect it (HMAC or AEAD) and bind it to the caller and a short expiry.
 - Legacy (≤ 2025-11-25) clients still work: the SDK fulfils the requests itself with server-to-client calls and re-invokes the handler once, so collect all input in one round for them. That needs a bidirectional session (stdio, in-memory, stateful HTTP) — it fails for legacy clients over stateless HTTP.

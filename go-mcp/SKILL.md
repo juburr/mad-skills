@@ -154,7 +154,8 @@ import "github.com/google/jsonschema-go/jsonschema"
 func deleteRepo(ctx context.Context, req *mcp.CallToolRequest, in DeleteInput) (*mcp.CallToolResult, any, error) {
     answer, answered := req.Params.InputResponses["confirm"].(*mcp.ElicitResult)
     if !answered {
-        if caps := req.ClientCapabilities(); caps == nil || caps.Elicitation == nil {
+        caps := req.ClientCapabilities() // URL-only clients cannot render forms
+        if caps == nil || caps.Elicitation == nil || (caps.Elicitation.Form == nil && caps.Elicitation.URL != nil) {
             return nil, nil, fmt.Errorf("client cannot confirm deletion; refusing")
         }
         return &mcp.CallToolResult{
@@ -184,7 +185,7 @@ func deleteRepo(ctx context.Context, req *mcp.CallToolRequest, in DeleteInput) (
 
 - MRTR works on `tools/call`, `prompts/get`, and `resources/read`; `GetPromptResult` and `ReadResourceResult` carry the same `InputRequests`/`RequestState` fields.
 - Never set both `InputRequests` and `Content` — the SDK rejects that as a server bug (`-32603`).
-- Only request what the client declared (check `req.ClientCapabilities()`).
+- Only request what the client declared (check `req.ClientCapabilities()`). Older clients send `elicitation: {}` (nil `Form` and `URL`) to mean form support.
 - The retry is a new, independent request; over stateless HTTP another instance may serve it. Carry progress in `RequestState`, not in memory, and treat it as attacker-controlled: integrity-protect it (HMAC or AEAD) and bind it to the caller and a short expiry.
 - Legacy (≤ 2025-11-25) clients still work: the SDK fulfils the requests itself with server-to-client calls and re-invokes the handler once. That needs a bidirectional session (stdio, in-memory, stateful HTTP) — it fails for legacy clients over stateless HTTP.
 

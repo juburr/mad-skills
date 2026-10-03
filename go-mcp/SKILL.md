@@ -281,7 +281,7 @@ defer session.Close()
 log.Println("negotiated", session.InitializeResult().ProtocolVersion)
 ```
 
-To pin an older protocol (e.g., to test legacy behavior), pass `&mcp.ClientSessionOptions{ProtocolVersion: "2025-11-25"}` to `Connect`.
+To request an older protocol (e.g., to test legacy behavior), pass `&mcp.ClientSessionOptions{ProtocolVersion: "2025-11-25"}` to `Connect`. The server may still negotiate a different supported version, so assert `session.InitializeResult().ProtocolVersion` when a test needs an exact revision.
 
 ### Calling Tools
 
@@ -421,7 +421,10 @@ func myTool(ctx context.Context, req *mcp.CallToolRequest, input MyInput) (*mcp.
     if req.Extra == nil || req.Extra.TokenInfo == nil { // Extra is nil on stdio/in-memory
         return nil, nil, &jsonrpc.Error{Code: jsonrpc.CodeInvalidRequest, Message: "unauthenticated"}
     }
-    tenantID, _ := req.Extra.TokenInfo.Extra["tenant_id"].(string)
+    tenantID, ok := req.Extra.TokenInfo.Extra["tenant_id"].(string)
+    if !ok || tenantID == "" { // fail closed: never run unscoped
+        return nil, nil, &jsonrpc.Error{Code: jsonrpc.CodeInvalidRequest, Message: "token missing tenant"}
+    }
     // Use tenantID for RLS, scoping queries, etc.
 }
 ```

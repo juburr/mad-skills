@@ -778,14 +778,23 @@ func TestMyTool(t *testing.T) {
 
 ### Testing Both Protocol Eras
 
-The test above runs on 2026-07-28. Run legacy-sensitive tests (MRTR shim, list-changed, subscriptions) a second time with a pinned version:
+The test above runs on 2026-07-28. Run legacy-sensitive tests (MRTR shim, list-changed, subscriptions) a second time requesting an older version. The option only sets the version the client asks for first, so assert what was negotiated:
 
 ```go
-for _, version := range []string{"", "2025-11-25"} { // "" = latest
+for _, want := range []string{"2026-07-28", "2025-11-25"} {
     serverT, clientT := mcp.NewInMemoryTransports()
-    server.Connect(ctx, serverT, nil)
-    session, err := client.Connect(ctx, clientT, &mcp.ClientSessionOptions{ProtocolVersion: version})
+    if _, err := server.Connect(ctx, serverT, nil); err != nil {
+        t.Fatal(err)
+    }
+    session, err := client.Connect(ctx, clientT, &mcp.ClientSessionOptions{ProtocolVersion: want})
+    if err != nil {
+        t.Fatal(err)
+    }
+    if got := session.InitializeResult().ProtocolVersion; got != want {
+        t.Fatalf("negotiated %s, want %s", got, want)
+    }
     // ... same assertions ...
+    session.Close()
 }
 ```
 

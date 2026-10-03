@@ -47,7 +47,7 @@ No new protocol revision; hardening and fixes over v1.7.0.
 - Bounded decoding: JSON nesting deeper than 1000 levels rejected; `StdioTransport.MaxLineLength` / `IOTransport.MaxLineLength` (16 MiB default); `MaxEventSize` on `SSEClientTransport` and `StreamableClientTransport` (16 MiB default); `SSEOptions.MaxRequestBodyBytes` / `SSEServerTransport.MaxRequestBodyBytes`; dynamic client registration responses capped at 1 MB.
 - `ServerOptions.SupportedProtocolVersions` and `mcp.SupportedProtocolVersions()` — narrow the versions a server offers.
 - `ServerOptions.SetCacheable` — per-request `ttlMs`/`cacheScope` policy.
-- `ClientSessionOptions.ProtocolVersion` exported — pin the client's starting version.
+- `ClientSessionOptions.ProtocolVersion` exported — set the version the client requests first.
 - `ServerSession.NotifyElicitationComplete` (legacy URL-mode elicitation).
 - `AuthorizationCodeHandlerConfig.ScopeFilter`, `AcceptUnadvertisedIss`.
 - OAuth discovery SSRF defaults: rejects HTTPS→HTTP redirects, redirects to private or loopback addresses, and private-IP targets (literal or resolved at dial time). A custom `DialContext` or proxy opts out.

@@ -370,11 +370,11 @@ Key options to enforce in reviews:
 
 Review rules:
 - **Validate what you read.** `createJSONStorage` casts parsed JSON to your state type without checks; corrupt, stale, or tampered storage reaches the store. Validate in `merge` or a custom `PersistStorage` (e.g., with a schema library).
-- **Hydration timing.** Synchronous storage (`localStorage`) hydrates during store creation; async storage does not. Gate UI on `store.persist.hasHydrated()` / `onFinishHydration` when display depends on persisted values.
+- **Hydration timing.** Synchronous storage (`localStorage`) hydrates during store creation unless an async `migrate` runs; async storage never does. Gate UI on `store.persist.hasHydrated()` / `onFinishHydration` when display depends on persisted values.
 - **No initial write (v5).** Persist only writes on `setState`. Call `setState` after creation if the initial value must be stored.
 - **`setState` return value (v5.0.8+).** On a persisted store, `set`/`setState` return the storage's `setItem` result — a Promise for async storage. Use a block body in effects (`useEffect(() => { store.setState(x) }, [])`). The expression form `useEffect(() => store.setState(x))` is a type error on persisted stores (`'unknown' is not assignable to 'void | Destructor'`) and returns a Promise from the effect with async storage.
 - **Server rendering.** When the storage getter throws (no `window` on the server), persist degrades to a plain in-memory store (each `set` call from an action logs a warning) and does **not** attach `store.persist`. Only touch `store.persist` in client code.
-- **`clearStorage()` cancels an in-flight hydration** (v5.0.15+), leaving `hasHydrated()` false. Call `rehydrate()` afterwards if UI is gated on hydration. Concurrent `rehydrate()` calls resolve last-call-wins (v5.0.10+).
+- **`clearStorage()` cancels an in-flight hydration** (v5.0.15+). In that case `hasHydrated()` stays `false` until the next `rehydrate()` — call it if UI is gated on hydration. After a completed hydration the flag stays `true`. Concurrent `rehydrate()` calls resolve last-call-wins (v5.0.10+).
 
 For custom storage engines, validation code, Map/Set persistence, cross-tab sync, devtools options, and `unstable_ssrSafe`, read `references/middleware.md`.
 

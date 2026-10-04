@@ -67,7 +67,7 @@ With the `redux` middleware, actions dispatched from the DevTools UI are forward
 | Option | Default | Notes |
 |---|---|---|
 | `name` | — (required) | Unique storage key. |
-| `storage` | `createJSONStorage(() => window.localStorage)` | A `PersistStorage`. The getter runs lazily; if it throws (SSR), persistence is disabled for that store. |
+| `storage` | `createJSONStorage(() => window.localStorage)` | A `PersistStorage`. `createJSONStorage` calls the getter immediately (the default one runs at store creation). If the getter throws (e.g., no `window` during SSR), persistence stays disabled for that store, even if the API becomes available later. |
 | `partialize` | identity | Returns the persisted subset. Its return type is the `PersistedState` used in mutator types. |
 | `version` | `0` | Stored alongside state. A mismatch triggers `migrate`. |
 | `migrate` | — | `(persisted: unknown, version: number) => PersistedState \| Promise<PersistedState>` — the `partialize` shape, which is then passed to `merge`. Without it, mismatched data is discarded with a console error. |
@@ -97,7 +97,7 @@ With the `redux` middleware, actions dispatched from the DevTools UI are forward
 5. If migrated, the migrated state is written back.
 6. Inner `onRehydrateStorage` callback runs with the latest state; `hasHydrated()` becomes `true`; `onFinishHydration` listeners run.
 
-With synchronous storage, all six steps finish before `create` returns, so the first render already sees persisted values. With async storage, the first render sees defaults.
+With synchronous storage and a synchronous (or no) `migrate`, all six steps finish before `create` returns, so the first render already sees persisted values. With async storage, or an async `migrate` triggered by a version mismatch, steps 4–6 run later and the first render sees defaults.
 
 `store.getInitialState()` on a persisted store returns the creator's defaults, not hydrated values. Resetting with `set(store.getInitialState())` also writes those defaults to storage.
 
@@ -193,15 +193,21 @@ persist(creator, {
 
 ### Cross-Tab Sync
 
-Persist does not listen for changes from other tabs. Rehydrate on the `storage` event:
+Persist does not listen for changes from other tabs. Handle the `storage` event for both writes and deletions:
 
 ```ts
 window.addEventListener('storage', (e) => {
-  if (e.key === useSettings.persist.getOptions().name && e.newValue) {
+  if (e.key !== useSettings.persist.getOptions().name) return
+  if (e.newValue === null) {
+    // Removed in another tab (e.g., clearStorage()): drop stale in-memory state
+    useSettings.setState(useSettings.getInitialState(), true)
+  } else {
     void useSettings.persist.rehydrate()
   }
 })
 ```
+
+The reset writes the defaults back to storage, so after a clear in one tab every tab converges on the defaults (stored, not absent). Rehydrating never writes unless a migration ran, so the tabs do not ping-pong events.
 
 ### Migrations
 

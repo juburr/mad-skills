@@ -407,7 +407,39 @@ afterEach(async () => {
 })
 ```
 
-For Jest, put the same file in `__mocks__/zustand.ts` adjacent to `node_modules` (auto-applied, no `jest.mock` call needed) and replace the `vi.importActual` line with:
+The mock replaces only the `zustand` specifier. Stores created with `createStore` imported from `zustand/vanilla` (like the store factory above) bypass it and leak between tests. Mock that entry point too, and add `vi.mock('zustand/vanilla')` to the setup file. A store may end up registered by both mocks; resetting it twice is harmless.
+
+```ts
+// __mocks__/zustand/vanilla.ts — enable with `vi.mock('zustand/vanilla')`
+import { act } from '@testing-library/react'
+import type * as ZustandVanillaTypes from 'zustand/vanilla'
+export * from 'zustand/vanilla'
+
+const { createStore: actualCreateStore } =
+  await vi.importActual<typeof ZustandVanillaTypes>('zustand/vanilla')
+
+const storeResetFns = new Set<() => unknown>()
+
+const createStoreUncurried = <T>(stateCreator: ZustandVanillaTypes.StateCreator<T>) => {
+  const store = actualCreateStore(stateCreator)
+  const initialState = store.getInitialState()
+  storeResetFns.add(() => store.setState(initialState, true))
+  return store
+}
+
+export const createStore = (<T>(stateCreator: ZustandVanillaTypes.StateCreator<T>) =>
+  typeof stateCreator === 'function'
+    ? createStoreUncurried(stateCreator)
+    : createStoreUncurried) as typeof ZustandVanillaTypes.createStore
+
+afterEach(async () => {
+  await act(async () => {
+    await Promise.all([...storeResetFns].map((resetFn) => resetFn()))
+  })
+})
+```
+
+For Jest, put the files in `__mocks__/zustand.ts` and `__mocks__/zustand/vanilla.ts` adjacent to `node_modules` (applied automatically, no `jest.mock` call needed) and replace each `await vi.importActual<...>(...)` call with `jest.requireActual<...>(...)`:
 
 ```ts
 const { create: actualCreate, createStore: actualCreateStore } =

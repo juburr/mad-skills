@@ -199,7 +199,7 @@ All documented v5 import paths:
 ```ts
 // Core
 import { create } from 'zustand'
-import { createStore } from 'zustand/vanilla' // also exported from 'zustand'
+import { createStore } from 'zustand/vanilla' // 'zustand' re-exports it but imports React; React-free projects must use this path
 import { useStore } from 'zustand'
 import type { StateCreator, StoreApi, UseBoundStore, ExtractState } from 'zustand' // ExtractState: v5.0.3+
 

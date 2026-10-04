@@ -50,6 +50,8 @@ const useFish = create<FishState>()(devtools(fishCreator, { name: 'App', store: 
 
 `store.devtools.cleanup()` (v5.0.5+) unsubscribes the extension connection and removes the store from a shared `name` group. Call it when discarding dynamically created stores (e.g., removing an entry from a keyed store map).
 
+Stores grouped under one `name` (via `store`) share a single connection, and `cleanup()` on any member unsubscribes that shared connection: time travel and DevTools dispatch stop working for the remaining members. Give dynamically created stores their own `name`, or clean up only when discarding the whole group.
+
 `store.devtools` is attached only when a connection was made. With `enabled: false`, in production builds, without the extension, or during SSR it is `undefined` even though its type says otherwise, so guard the call:
 
 ```ts
@@ -80,9 +82,9 @@ With the `redux` middleware, actions dispatched from the DevTools UI are forward
 | Method | Behavior |
 |---|---|
 | `rehydrate()` | Re-reads storage. Typed `Promise<void> \| void`; returns a real Promise only for async storage, but `await` works either way. Concurrent calls resolve last-call-wins (v5.0.10+). |
-| `hasHydrated()` | `true` after the most recent hydration finished. |
+| `hasHydrated()` | `true` after the most recent hydration succeeded. Stays `false` if `getItem` rejects or `migrate` throws. |
 | `onHydrate(fn)` | Listener called when hydration starts. Returns an unsubscribe function. |
-| `onFinishHydration(fn)` | Listener called when hydration finishes. Returns an unsubscribe function. |
+| `onFinishHydration(fn)` | Listener called when hydration succeeds (not on failure). Returns an unsubscribe function. |
 | `clearStorage()` | Removes the storage item and cancels any in-flight hydration (v5.0.15+). If it cancelled one, `hasHydrated()` stays `false` until the next `rehydrate()`; after a completed hydration it stays `true`. Does not reset in-memory state. |
 | `getOptions()` / `setOptions(partial)` | Read or change options at runtime (e.g., switch `name` per user). |
 
@@ -96,6 +98,8 @@ With the `redux` middleware, actions dispatched from the DevTools UI are forward
 4. `merge(persisted, current)` → state replaced with the result.
 5. If migrated, the migrated state is written back.
 6. Inner `onRehydrateStorage` callback runs with the latest state; `hasHydrated()` becomes `true`; `onFinishHydration` listeners run.
+
+If `getItem` rejects or `migrate` throws, the chain stops: the inner `onRehydrateStorage` callback runs as `(undefined, error)`, `hasHydrated()` stays `false`, and `onFinishHydration` listeners never run. Handle failures in that callback (e.g., set an error flag) so UI gated on hydration does not wait forever.
 
 With synchronous storage and a synchronous (or no) `migrate`, all six steps finish before `create` returns, so the first render already sees persisted values. With async storage, or an async `migrate` triggered by a version mismatch, steps 4–6 run later and the first render sees defaults.
 

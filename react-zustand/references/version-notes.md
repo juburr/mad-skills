@@ -9,7 +9,7 @@ Release history and behavior changes for `zustand` v5.0.0 through **v5.0.15** (t
 | v5.0.x | 18+ (`react`, `@types/react` are optional peers) | 4.5+ | `use-sync-external-store` peer needed only for `zustand/traditional`; `immer` only for `zustand/middleware/immer` |
 | v4.5.x | 16.8+ | — | Maintenance line; receives selected backports |
 
-All v5.0.x releases are API-compatible. Upgrade to the latest 5.0.x; use these floors when a specific fix matters:
+No v5.0.x release removed or renamed a public API, but patch releases did change some types and observable behavior — most notably persisted `set`/`setState` returning the storage result since v5.0.8, which breaks expression-bodied effects at compile time. Review "Stale Patterns" below before upgrading across those releases. Upgrade to the latest 5.0.x; use these floors when a specific fix matters:
 
 | Need | Minimum |
 |---|---|

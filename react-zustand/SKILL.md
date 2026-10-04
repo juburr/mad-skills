@@ -11,7 +11,7 @@ description: Guides Zustand v5 state management including store design, selector
 
 Lightweight state management for React and framework-agnostic applications. Zustand stores are plain JavaScript objects exposed as hooks — no providers, no boilerplate.
 
-> **Verified against Zustand v5.0.15** (released 2026-08-13). v5 requires TypeScript 4.5+ and, for the React entry points, React 18+. All v5.0.x releases are API-compatible, but devtools, persist, and `shallow` behavior changed across patch releases. If your knowledge of Zustand predates v5.0.5, read `references/version-notes.md` before relying on recalled behavior.
+> **Verified against Zustand v5.0.15** (released 2026-08-13). v5 requires TypeScript 4.5+ and, for the React entry points, React 18+. No v5.0.x release removed an API, but patch releases changed some types and devtools, persist, and `shallow` behavior (e.g., persisted `setState`'s return type in v5.0.8). If your knowledge of Zustand predates v5.0.5, read `references/version-notes.md` before relying on recalled behavior.
 
 ```bash
 npm install zustand@^5.0.15
@@ -31,7 +31,8 @@ Optional peer dependencies — install only what you use:
 // React store (most common)
 import { create } from 'zustand'
 
-// Vanilla store (framework-agnostic; also re-exported from 'zustand')
+// Vanilla store (framework-agnostic). The 'zustand' root also re-exports it but imports React,
+// so projects without React must import from 'zustand/vanilla'
 import { createStore } from 'zustand/vanilla'
 
 // Bind any store (vanilla or bound) into React
@@ -336,7 +337,7 @@ const useStore = create<MyState>()(
 - Name actions via the third `set` argument: `set((s) => ({ bears: s.bears + 1 }), undefined, 'bears/increment')`. An object `{ type, ...payload }` also works.
 - Unnamed updates are labeled `anonymousActionType` if set, else the caller name inferred from the stack trace (v5.0.5+; e.g., `Object.inc`), else `'anonymous'`. Inference is best-effort and breaks under minification — name important actions explicitly.
 - **Always pass `enabled` explicitly.** The default only disables devtools when `import.meta.env.MODE === 'production'` (ESM build) or `process.env.NODE_ENV === 'production'` (CJS build). Bundlers that resolve the ESM build without defining `import.meta.env` (common in webpack-based setups) leave devtools connected in production. Use `enabled: import.meta.env.DEV` in Vite, `enabled: process.env.NODE_ENV !== 'production'` elsewhere.
-- `store.devtools?.cleanup()` (v5.0.5+) disconnects a store — call it when discarding dynamically created stores. `store.devtools` is `undefined` whenever devtools did not connect (disabled, production, no extension, SSR), despite its type, so keep the `?.`.
+- `store.devtools?.cleanup()` (v5.0.5+) disconnects a store — call it when discarding dynamically created stores. For stores grouped under one `name` via `store`, it unsubscribes the shared connection, so call it only when discarding the whole group. `store.devtools` is `undefined` whenever devtools did not connect (disabled, production, no extension, SSR), despite its type, so keep the `?.`.
 - `actionsDenylist: ['internal/.*']` hides matching actions in the DevTools UI (filtering happens in the extension; actions are still sent).
 
 ### Persist
@@ -370,7 +371,7 @@ Key options to enforce in reviews:
 
 Review rules:
 - **Validate what you read.** `createJSONStorage` casts parsed JSON to your state type without checks; corrupt, stale, or tampered storage reaches the store. Validate in `merge` or a custom `PersistStorage` (e.g., with a schema library).
-- **Hydration timing.** Synchronous storage (`localStorage`) hydrates during store creation unless an async `migrate` runs; async storage never does. Gate UI on `store.persist.hasHydrated()` / `onFinishHydration` when display depends on persisted values.
+- **Hydration timing.** Synchronous storage (`localStorage`) hydrates during store creation unless an async `migrate` runs; async storage never does. Gate UI on `store.persist.hasHydrated()` / `onFinishHydration` when display depends on persisted values. Both report success only: if `getItem` or `migrate` fails, only the inner `onRehydrateStorage` callback runs (with the error), so handle failures there or the gate never opens.
 - **No initial write (v5).** Persist only writes on `setState`. Call `setState` after creation if the initial value must be stored.
 - **`setState` return value (v5.0.8+).** On a persisted store, `set`/`setState` return the storage's `setItem` result — a Promise for async storage. Use a block body in effects (`useEffect(() => { store.setState(x) }, [])`). The expression form `useEffect(() => store.setState(x))` is a type error on persisted stores (`'unknown' is not assignable to 'void | Destructor'`) and returns a Promise from the effect with async storage.
 - **Server rendering.** When the storage getter throws (no `window` on the server), persist degrades to a plain in-memory store (each `set` call from an action logs a warning) and does **not** attach `store.persist`. Only touch `store.persist` in client code.

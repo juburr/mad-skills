@@ -281,6 +281,8 @@ const useHydration = () => {
 
 Starting from `false` keeps the first client render identical to the server render.
 
+Solutions B and C flip only on successful hydration. If `getItem` rejects or `migrate` throws, the inner `onRehydrateStorage` callback receives `(undefined, error)` and `onFinishHydration` never fires, so render an error or fallback state from that callback instead of a skeleton that never resolves.
+
 ## Resetting Store State
 
 ### Using `getInitialState`

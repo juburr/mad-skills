@@ -372,14 +372,13 @@ export * from 'zustand'
 const { create: actualCreate, createStore: actualCreateStore } =
   await vi.importActual<typeof ZustandExportedTypes>('zustand')
 
-export const storeResetFns = new Set<() => void>()
+// Reset fns return setState's result: a pending write for persisted stores with async storage
+export const storeResetFns = new Set<() => unknown>()
 
 const createUncurried = <T>(stateCreator: ZustandExportedTypes.StateCreator<T>) => {
   const store = actualCreate(stateCreator)
   const initialState = store.getInitialState()
-  storeResetFns.add(() => {
-    store.setState(initialState, true)
-  })
+  storeResetFns.add(() => store.setState(initialState, true))
   return store
 }
 
@@ -392,9 +391,7 @@ export const create = (<T>(stateCreator: ZustandExportedTypes.StateCreator<T>) =
 const createStoreUncurried = <T>(stateCreator: ZustandExportedTypes.StateCreator<T>) => {
   const store = actualCreateStore(stateCreator)
   const initialState = store.getInitialState()
-  storeResetFns.add(() => {
-    store.setState(initialState, true)
-  })
+  storeResetFns.add(() => store.setState(initialState, true))
   return store
 }
 
@@ -403,11 +400,9 @@ export const createStore = (<T>(stateCreator: ZustandExportedTypes.StateCreator<
     ? createStoreUncurried(stateCreator)
     : createStoreUncurried) as typeof ZustandExportedTypes.createStore
 
-afterEach(() => {
-  act(() => {
-    storeResetFns.forEach((resetFn) => {
-      resetFn()
-    })
+afterEach(async () => {
+  await act(async () => {
+    await Promise.all([...storeResetFns].map((resetFn) => resetFn()))
   })
 })
 ```

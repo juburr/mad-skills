@@ -50,6 +50,12 @@ const useFish = create<FishState>()(devtools(fishCreator, { name: 'App', store: 
 
 `store.devtools.cleanup()` (v5.0.5+) unsubscribes the extension connection and removes the store from a shared `name` group. Call it when discarding dynamically created stores (e.g., removing an entry from a keyed store map).
 
+`store.devtools` is attached only when a connection was made. With `enabled: false`, in production builds, without the extension, or during SSR it is `undefined` even though its type says otherwise, so guard the call:
+
+```ts
+useCartStore.devtools?.cleanup()
+```
+
 ### Redux DevTools Dispatch
 
 With the `redux` middleware, actions dispatched from the DevTools UI are forwarded to the store's `dispatch`. The action type `__setState` is reserved for setting state from DevTools.
@@ -64,7 +70,7 @@ With the `redux` middleware, actions dispatched from the DevTools UI are forward
 | `storage` | `createJSONStorage(() => window.localStorage)` | A `PersistStorage`. The getter runs lazily; if it throws (SSR), persistence is disabled for that store. |
 | `partialize` | identity | Returns the persisted subset. Its return type is the `PersistedState` used in mutator types. |
 | `version` | `0` | Stored alongside state. A mismatch triggers `migrate`. |
-| `migrate` | — | `(persisted: unknown, version: number) => State \| Promise<State>`. Without it, mismatched data is discarded with a console error. |
+| `migrate` | — | `(persisted: unknown, version: number) => PersistedState \| Promise<PersistedState>` — the `partialize` shape, which is then passed to `merge`. Without it, mismatched data is discarded with a console error. |
 | `merge` | shallow `{ ...current, ...persisted }` | `(persisted: unknown, current: State) => State`. Customize for nested state or validation. |
 | `onRehydrateStorage` | — | `(state) => (hydratedState?, error?) => void`. Outer runs before hydration; inner runs after with the latest state, or with an error. |
 | `skipHydration` | `false` | Skip automatic hydration at creation; call `store.persist.rehydrate()` manually. |
@@ -77,7 +83,7 @@ With the `redux` middleware, actions dispatched from the DevTools UI are forward
 | `hasHydrated()` | `true` after the most recent hydration finished. |
 | `onHydrate(fn)` | Listener called when hydration starts. Returns an unsubscribe function. |
 | `onFinishHydration(fn)` | Listener called when hydration finishes. Returns an unsubscribe function. |
-| `clearStorage()` | Removes the storage item and cancels any in-flight hydration (v5.0.15+); `hasHydrated()` stays `false` until the next `rehydrate()`. Does not reset in-memory state. |
+| `clearStorage()` | Removes the storage item and cancels any in-flight hydration (v5.0.15+). If it cancelled one, `hasHydrated()` stays `false` until the next `rehydrate()`; after a completed hydration it stays `true`. Does not reset in-memory state. |
 | `getOptions()` / `setOptions(partial)` | Read or change options at runtime (e.g., switch `name` per user). |
 
 `store.persist` is **not attached** when the storage getter throws (e.g., `window` is undefined during server rendering). Guard server code accordingly.
@@ -300,18 +306,22 @@ type LoggerImpl = <T>(f: StateCreator<T, [], []>, name?: string) => StateCreator
 
 const loggerImpl: LoggerImpl = (f, name) => (set, get, store) => {
   const loggedSet: typeof set = (...a) => {
-    set(...(a as Parameters<typeof set>))
+    const result = set(...(a as Parameters<typeof set>))
     console.log(name ?? 'store', get())
+    return result // keep persist's setItem result (a Promise for async storage)
   }
   const setState = store.setState
   store.setState = (...a) => {
-    setState(...(a as Parameters<typeof setState>))
+    const result = setState(...(a as Parameters<typeof setState>))
     console.log(name ?? 'store', store.getState())
+    return result
   }
   return f(loggedSet, get, store)
 }
 
 export const logger = loggerImpl as unknown as Logger
 ```
+
+Wrappers must return what the wrapped `set`/`setState` returns — otherwise an outer `persist` loses its awaitable `setItem` result.
 
 Middleware that adds properties to the store (like `persist` adds `store.persist`) must also declare a mutator by augmenting the `StoreMutators` interface (`declare module 'zustand' { interface StoreMutators<S, A> { ... } }`) and typing its signature with that mutator identifier, as the built-in middlewares do.

@@ -336,7 +336,7 @@ const useStore = create<MyState>()(
 - Name actions via the third `set` argument: `set((s) => ({ bears: s.bears + 1 }), undefined, 'bears/increment')`. An object `{ type, ...payload }` also works.
 - Unnamed updates are labeled `anonymousActionType` if set, else the caller name inferred from the stack trace (v5.0.5+; e.g., `Object.inc`), else `'anonymous'`. Inference is best-effort and breaks under minification — name important actions explicitly.
 - **Always pass `enabled` explicitly.** The default only disables devtools when `import.meta.env.MODE === 'production'` (ESM build) or `process.env.NODE_ENV === 'production'` (CJS build). Bundlers that resolve the ESM build without defining `import.meta.env` (common in webpack-based setups) leave devtools connected in production. Use `enabled: import.meta.env.DEV` in Vite, `enabled: process.env.NODE_ENV !== 'production'` elsewhere.
-- `store.devtools.cleanup()` (v5.0.5+) disconnects a store — call it when discarding dynamically created stores.
+- `store.devtools?.cleanup()` (v5.0.5+) disconnects a store — call it when discarding dynamically created stores. `store.devtools` is `undefined` whenever devtools did not connect (disabled, production, no extension, SSR), despite its type, so keep the `?.`.
 - `actionsDenylist: ['internal/.*']` hides matching actions in the DevTools UI (filtering happens in the extension; actions are still sent).
 
 ### Persist

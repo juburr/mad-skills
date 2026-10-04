@@ -38,7 +38,7 @@ export function zustandToSvelte<S extends StoreApi<any>>(zustandStore: S) {
   return {
     ...zustandStore,                                // preserve getState, setState
     subscribe: svelteReadable.subscribe,            // override for Svelte $store compatibility
-    zustandSubscribe: zustandStore.subscribe,        // original Zustand subscribe for external listeners
+    zustandSubscribe: zustandStore.subscribe as S['subscribe'], // original Zustand subscribe for external listeners
   }
 }
 ```
@@ -48,7 +48,7 @@ export function zustandToSvelte<S extends StoreApi<any>>(zustandStore: S) {
 - The `start` function re-reads `getState()` on first subscription, preventing stale snapshots when state changes between adapter creation and first subscriber (common with persist rehydration).
 - `zustandStore.subscribe(...)` forwards future updates.
 - `subscribe` is overridden for Svelte's `$` auto-subscription.
-- `zustandSubscribe` preserves the original Zustand subscribe function for non-Svelte code. The `S extends StoreApi<any>` generic retains middleware-enhanced typings (e.g., `subscribeWithSelector` overloads).
+- `zustandSubscribe` preserves the original Zustand subscribe function for non-Svelte code. The `S extends StoreApi<any>` generic plus the `as S['subscribe']` cast retain middleware-enhanced typings (e.g., `subscribeWithSelector` overloads) — without the cast, property access on the generic resolves to the base `StoreApi` signature.
 
 ## Creating a Store
 
@@ -99,10 +99,12 @@ Middleware (`devtools`, `persist`, etc.) works identically to the React setup si
 
 <p>Count: {$counterStore.value}</p>
 
-<button on:click={() => $counterStore.actions.increment()}>+1</button>
-<button on:click={() => $counterStore.actions.decrement()}>-1</button>
-<button on:click={() => $counterStore.actions.reset()}>Reset</button>
+<button onclick={() => $counterStore.actions.increment()}>+1</button>
+<button onclick={() => $counterStore.actions.decrement()}>-1</button>
+<button onclick={() => $counterStore.actions.reset()}>Reset</button>
 ```
+
+The example uses Svelte 5 event attributes (`onclick`); Svelte 4 uses `on:click`. The `$store` auto-subscription syntax works in both, including Svelte 5 runes mode.
 
 Key points:
 - `$counterStore` auto-subscribes using the overridden `.subscribe`.

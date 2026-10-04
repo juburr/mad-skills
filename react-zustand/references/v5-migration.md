@@ -127,12 +127,14 @@ store.setState({ count: 0, name: '' }, true)
 
 If you are not using the `replace` flag (`setState(partial)` or `setState(partial, false)`), no change is needed.
 
-A flag computed at runtime (`boolean`) matches neither overload. Cast the argument tuple instead of using `as any`:
+A flag computed at runtime (`boolean`) matches neither overload. Branch rather than cast, so a partial object can never replace the whole state:
 
 ```ts
-const args = [{ count: 0, name: '' }, shouldReplace] as Parameters<typeof store.setState>
-store.setState(...args)
+if (shouldReplace) store.setState({ count: 0, name: '' }, true) // complete state
+else store.setState({ count: 0 })                               // partial merge
 ```
+
+A tuple cast (`[next, shouldReplace] as Parameters<typeof store.setState>`) also compiles, but it hides a partial `next` that would wipe the omitted keys when the flag is `true`.
 
 ### 5. `destroy` Method Removed
 
@@ -209,7 +211,8 @@ import { useStoreWithEqualityFn } from 'zustand/traditional'
 
 // Shallow comparison
 import { useShallow } from 'zustand/react/shallow'  // React hook
-import { shallow } from 'zustand/shallow'            // plain comparison function
+import { shallow } from 'zustand/shallow'            // plain comparison function (module also imports React)
+import { shallow } from 'zustand/vanilla/shallow'    // same function, React-free
 
 // Middleware
 import { devtools, persist, subscribeWithSelector, combine, redux } from 'zustand/middleware'

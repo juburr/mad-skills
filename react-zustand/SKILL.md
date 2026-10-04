@@ -32,7 +32,7 @@ Optional peer dependencies — install only what you use:
 import { create } from 'zustand'
 
 // Vanilla store (framework-agnostic). The 'zustand' root also re-exports it but imports React,
-// so projects without React must import from 'zustand/vanilla'
+// so projects without React must import from 'zustand/vanilla' (and 'zustand/vanilla/shallow')
 import { createStore } from 'zustand/vanilla'
 
 // Bind any store (vanilla or bound) into React
@@ -43,7 +43,7 @@ import type { StateCreator, StoreApi, UseBoundStore, ExtractState } from 'zustan
 
 // Shallow comparison utilities
 import { useShallow } from 'zustand/react/shallow' // also exported from 'zustand/shallow'
-import { shallow } from 'zustand/shallow'
+import { shallow } from 'zustand/shallow' // imports React too; React-free: 'zustand/vanilla/shallow'
 
 // Equality-function variant (requires use-sync-external-store peer dep)
 import { createWithEqualityFn, useStoreWithEqualityFn } from 'zustand/traditional'
@@ -143,7 +143,7 @@ export const useBearStore = create<{ bears: number }>()(() => ({ bears: 0 }))
 export const inc = () => useBearStore.setState((s) => ({ bears: s.bears + 1 }))
 ```
 
-The built-in middlewares patch `store.setState`, so external actions still get Immer drafts, persistence, and DevTools logging (`useBearStore.setState(fn, false, 'bears/inc')`). A custom middleware that only wraps the `set` argument passed to the initializer does **not** affect `store.setState` — the upstream README's "middlewares that modify `set` or `get` are not applied to `getState` and `setState`" warning refers to that case.
+The built-in middlewares patch `store.setState`, so external actions still get Immer drafts, persistence, and DevTools logging. An action name passed as `store.setState`'s third argument is dropped when `persist` sits inside `devtools` (persist's wrapper forwards two arguments), so name such updates inside store actions. A custom middleware that only wraps the `set` argument passed to the initializer does **not** affect `store.setState` — the upstream README's "middlewares that modify `set` or `get` are not applied to `getState` and `setState`" warning refers to that case.
 
 ## Slices Pattern
 
@@ -425,7 +425,7 @@ type BearState = ExtractState<typeof useBearStore> // { bears: number; inc: () =
 
 ### Dynamic `replace` Flag
 
-`setState(partial, flag)` with a runtime `boolean` flag fails overload resolution. Cast the argument tuple: `store.setState(...([next, flag] as Parameters<typeof store.setState>))`.
+`setState(next, flag)` with a runtime `boolean` flag fails overload resolution. Branch instead of casting, so a partial object can never replace the whole state: `flag ? store.setState(fullState, true) : store.setState(partial)`. A tuple cast (`as Parameters<typeof store.setState>`) is safe only when `next` is already a complete state.
 
 ## Common Pitfalls
 

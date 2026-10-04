@@ -36,6 +36,8 @@ set({ items: [] }, undefined, { type: 'cart/clear', reason: 'checkout' })
 useCartStore.setState({ open: true }, undefined, 'cart/open') // external action
 ```
 
+With `devtools(persist(...))`, the external form loses its name: persist's `store.setState` wrapper forwards only `(state, replace)`, so DevTools shows an inferred label (`api.setState`) instead. Names passed to `set` inside actions survive, as do external names through `immer`. Route external updates that need a stable name through a store action.
+
 Resolution order for the action type: explicit name > `anonymousActionType` > caller name inferred from `new Error().stack` (v5.0.5+; V8, SpiderMonkey, and JavaScriptCore formats since v5.0.13) > `'anonymous'`. Inferred names look like `Object.addItem` for object-literal actions and are mangled by minification.
 
 ### Multiple Stores, One DevTools Instance

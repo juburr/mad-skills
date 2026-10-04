@@ -81,7 +81,7 @@ const bears = useBearStore.use.bears()         // atomic selector, type-safe
 const increment = useBearStore.use.increment() // stable action ref
 ```
 
-Keys are captured when `createSelectors` runs — state keys added later get no hook. For a vanilla store, constrain `S extends StoreApi<object>` and build each hook with `useStore(_store, (s) => s[k as keyof typeof s])` instead of calling the store.
+Keys are captured when `createSelectors` runs from `Object.keys(getState())`. Keys absent from the initial object (optional fields, symbol keys, keys added later) still get a typed hook that is `undefined` at runtime — initialize optional fields explicitly (`user: undefined`). For a vanilla store, constrain `S extends StoreApi<object>` and build each hook with `useStore(_store, (s) => s[k as keyof typeof s])` instead of calling the store.
 
 ## Scoped Stores via Context
 

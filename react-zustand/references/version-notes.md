@@ -32,7 +32,7 @@ All v5.0.x releases are API-compatible. Upgrade to the latest 5.0.x; use these f
 - **Persisted `setState` returns `void`** — since v5.0.8 it returns the storage's `setItem` result (a Promise for async storage). `useEffect(() => store.setState(x))` now returns that value from the effect.
 - **`StateStorage` / `PersistStorage<S>` without a return type parameter** — since v5.0.8 they are `StateStorage<R = unknown>` and `PersistStorage<S, R = unknown>`; `PersistOptions` gained a third `PersistReturn` parameter. Existing annotations still compile because of the defaults.
 - **Unnamed DevTools actions always show `anonymous`** — since v5.0.5 the caller name is inferred from the stack trace unless `anonymousActionType` is set.
-- **`shallow({}, Object.create(null))` or two class instances with equal fields compare equal** — since v5.0.5 differing prototypes compare `false`.
+- **`shallow({}, Object.create(null))` or instances of two different classes with equal fields compare equal** — since v5.0.5 differing prototypes compare `false`. Two instances of the same class still compare by their enumerable fields.
 - **`shallow({ a: undefined }, { b: undefined })` is `true`** — fixed in v5.0.8; key presence is now checked.
 - **`ExtractState` must be hand-written** — exported from `zustand` since v5.0.3.
 - **`import { devtools } from 'zustand/middleware/devtools'`** (and `.../persist`, `.../combine`, `.../subscribeWithSelector`, `.../redux`) — these paths ship only type declarations, so they type-check but fail at runtime. Import from `zustand/middleware`; only `immer` has its own entry (`zustand/middleware/immer`).

@@ -69,7 +69,7 @@ With the `redux` middleware, actions dispatched from the DevTools UI are forward
 | `name` | — (required) | Unique storage key. |
 | `storage` | `createJSONStorage(() => window.localStorage)` | A `PersistStorage`. `createJSONStorage` calls the getter immediately (the default one runs at store creation). If the getter throws (e.g., no `window` during SSR), persistence stays disabled for that store, even if the API becomes available later. |
 | `partialize` | identity | Returns the persisted subset. Its return type is the `PersistedState` used in mutator types. |
-| `version` | `0` | Stored alongside state. A mismatch triggers `migrate`. |
+| `version` | `0` | Stored alongside state. A numeric stored version that differs triggers `migrate`. Records with no numeric `version` (custom storage, hand-written data) skip `migrate` and are merged as-is — normalize them in `merge` or the storage. |
 | `migrate` | — | `(persisted: unknown, version: number) => PersistedState \| Promise<PersistedState>` — the `partialize` shape, which is then passed to `merge`. Without it, mismatched data is discarded with a console error. |
 | `merge` | shallow `{ ...current, ...persisted }` | `(persisted: unknown, current: State) => State`. Customize for nested state or validation. |
 | `onRehydrateStorage` | — | `(state) => (hydratedState?, error?) => void`. Outer runs before hydration; inner runs after with the latest state, or with an error. |
@@ -303,10 +303,11 @@ type Logger = <
   T,
   Mps extends [StoreMutatorIdentifier, unknown][] = [],
   Mcs extends [StoreMutatorIdentifier, unknown][] = [],
+  U = T, // initializer return type; lets slice creators pass through
 >(
-  f: StateCreator<T, Mps, Mcs>,
+  f: StateCreator<T, Mps, Mcs, U>,
   name?: string,
-) => StateCreator<T, Mps, Mcs>
+) => StateCreator<T, Mps, Mcs, U>
 
 type LoggerImpl = <T>(f: StateCreator<T, [], []>, name?: string) => StateCreator<T, [], []>
 

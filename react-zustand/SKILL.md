@@ -97,7 +97,7 @@ counterStore.subscribe((state, prevState) => console.log(state, prevState))
 - `set(partial)` performs a **shallow merge** by default.
 - `set(partial, true)` **replaces** the entire state and requires a complete state object (type error otherwise). It wipes actions if they live in state.
 - Use updater functions for state based on previous state: `set((s) => ({ count: s.count + 1 }))`.
-- An updater that returns the current state object (`set((s) => s)`) is a no-op. Any other `set` creates a new state object and notifies every listener, even if all values are equal — selectors decide whether components re-render.
+- `set` skips listeners when the next state is `Object.is`-equal to the current one (`set((s) => s)`, `set(get())`); middleware side effects such as persist's write still run. Any other `set` creates a new state object and notifies every listener, even if all values are equal — selectors decide whether components re-render.
 - Never mutate state directly. `getState().obj.field = value` is always a bug.
 - `set`, `get`, and the store API cannot be used while the initializer runs. `create((set, get) => ({ a: 1, b: get().a }))` throws because state does not exist yet — compute derived initial values locally instead.
 
@@ -131,7 +131,7 @@ export const useBearStore = create<BearState>()((set) => ({
 const { inc, reset } = useBearStore((s) => s.actions)
 ```
 
-**Persist caveat:** JSON serializes the nested `actions` object as `{}`, and the default shallow merge then overwrites the real actions on rehydration. Always `partialize` data-only fields when combining this pattern with `persist`.
+**Serialization caveat:** JSON serializes the nested `actions` object as `{}`, and a shallow merge of a JSON snapshot overwrites the real actions. With `persist`, always `partialize` data-only fields. With `devtools`, time travel, rollback, and imported state restore such snapshots too — prefer top-level actions (Pattern A) in stores you debug that way.
 
 ### Pattern C: External Actions
 

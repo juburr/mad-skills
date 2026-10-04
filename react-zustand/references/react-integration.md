@@ -296,7 +296,12 @@ const useStore = create<State & Actions>()((set, get, store) => ({
 useStore.setState(useStore.getInitialState(), true)
 ```
 
-On a persisted store, `getInitialState()` returns the creator's defaults and the reset writes them to storage. Call `store.persist.clearStorage()` too if the stored item should be removed rather than overwritten.
+On a persisted store, `getInitialState()` returns the creator's defaults and the reset writes them to storage. To remove the stored item instead, await the reset before clearing — with async storage an unawaited write can land after the removal and recreate the item:
+
+```ts
+await useStore.setState(useStore.getInitialState(), true)
+useStore.persist.clearStorage() // returns void; call storage.removeItem directly if you must await the removal
+```
 
 ## Testing
 

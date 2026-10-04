@@ -232,11 +232,13 @@ const useStore = create<CounterState & HydrationState>()(
   persist(
     (set) => ({
       count: 0,
+      inc: () => set((s) => ({ count: s.count + 1 })),
       _hasHydrated: false,
       setHasHydrated: (val: boolean) => set({ _hasHydrated: val }),
     }),
     {
       name: 'counter-storage',
+      skipHydration: true, // required for SSR — see below
       partialize: (s) => ({ count: s.count }), // never persist the flag
       onRehydrateStorage: () => (state) => {
         state?.setHasHydrated(true)
@@ -245,10 +247,17 @@ const useStore = create<CounterState & HydrationState>()(
   ),
 )
 
-// In component:
+// Once, in a client component near the root:
+useEffect(() => {
+  void useStore.persist.rehydrate()
+}, [])
+
+// In components:
 const hasHydrated = useStore((s) => s._hasHydrated)
 if (!hasHydrated) return <Skeleton />
 ```
+
+Keep `skipHydration: true` in SSR apps. Without it, synchronous `localStorage` hydrates during client-side store creation, so `_hasHydrated` is already `true` on the first client render while the server rendered `<Skeleton />` — a hydration mismatch.
 
 ### Solution C: `useHydration` Hook (No Extra State)
 
@@ -363,8 +372,8 @@ it('renders with initial bears', () => {
 For many global stores, mock `zustand` so every store created by `create` or `createStore` resets after each test. A manual mock replaces the entire module: keep `export * from 'zustand'` and wrap both `create` and `createStore`, or `useStore`, `createStore`, and everything else become `undefined` in tests. Load the real implementations with `vi.importActual` / `jest.requireActual`.
 
 ```ts
-// __mocks__/zustand.ts — Vitest. Place next to the configured `root`;
-// enable with `vi.mock('zustand')` in a setup file.
+// __mocks__/zustand.ts — Vitest. Place next to the configured `root`.
+import { afterEach, vi } from 'vitest'
 import { act } from '@testing-library/react'
 import type * as ZustandExportedTypes from 'zustand'
 export * from 'zustand'
@@ -407,10 +416,11 @@ afterEach(async () => {
 })
 ```
 
-The mock replaces only the `zustand` specifier. Stores created with `createStore` imported from `zustand/vanilla` (like the store factory above) bypass it and leak between tests. Mock that entry point too, and add `vi.mock('zustand/vanilla')` to the setup file. A store may end up registered by both mocks; resetting it twice is harmless.
+The mock replaces only the `zustand` specifier. Stores created with `createStore` imported from `zustand/vanilla` (like the store factory above) bypass it and leak between tests. Mock that entry point too. A store may end up registered by both mocks; resetting it twice is harmless.
 
 ```ts
-// __mocks__/zustand/vanilla.ts — enable with `vi.mock('zustand/vanilla')`
+// __mocks__/zustand/vanilla.ts
+import { afterEach, vi } from 'vitest'
 import { act } from '@testing-library/react'
 import type * as ZustandVanillaTypes from 'zustand/vanilla'
 export * from 'zustand/vanilla'
@@ -439,7 +449,17 @@ afterEach(async () => {
 })
 ```
 
-For Jest, put the files in `__mocks__/zustand.ts` and `__mocks__/zustand/vanilla.ts` adjacent to `node_modules` (applied automatically, no `jest.mock` call needed) and replace each `await vi.importActual<...>(...)` call with `jest.requireActual<...>(...)`:
+Enable both mocks in a file listed in `test.setupFiles`:
+
+```ts
+// vitest.setup.ts
+import { vi } from 'vitest'
+
+vi.mock('zustand')
+vi.mock('zustand/vanilla')
+```
+
+For Jest, put the files in `__mocks__/zustand.ts` and `__mocks__/zustand/vanilla.ts` adjacent to `node_modules` (applied automatically, no `jest.mock` call needed), drop the `vitest` import, and replace each `await vi.importActual<...>(...)` call with `jest.requireActual<...>(...)`:
 
 ```ts
 const { create: actualCreate, createStore: actualCreateStore } =

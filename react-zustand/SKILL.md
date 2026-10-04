@@ -216,7 +216,7 @@ The same loop occurs with inline fallbacks: `(s) => s.items ?? []` or `(s) => s.
 
 | Input | Comparison |
 |---|---|
-| Plain objects | Own enumerable keys, order-insensitive; values by `Object.is` |
+| Plain objects | Own enumerable string keys (symbol keys ignored), order-insensitive; values by `Object.is` |
 | Arrays / ordered iterables | Index by index |
 | `Map` / `Set` | Entries, order-insensitive |
 | Different prototypes | Always `false` (e.g., `{}` vs `Object.create(proto)`, two different classes) |

@@ -1,6 +1,6 @@
 # React Integration
 
-Patterns for using Zustand in React applications, including scoped stores, Next.js App Router, SSR hydration, and testing.
+Patterns for using Zustand in React applications, including scoped stores, Next.js App Router, SSR hydration, and testing. Verified against Zustand v5.0.15.
 
 ## Standard Usage
 
@@ -55,12 +55,41 @@ export const useBearActions = () => useStoreBase((s) => s.actions)
 // Do NOT export useStoreBase directly
 ```
 
+### Generated Selector Hooks
+
+Eliminate selector boilerplate by generating `.use.<key>()` hooks for every top-level state key.
+
+```ts
+import type { StoreApi, UseBoundStore } from 'zustand'
+
+type WithSelectors<S> = S extends { getState: () => infer T }
+  ? S & { use: { [K in keyof T]: () => T[K] } }
+  : never
+
+const createSelectors = <S extends UseBoundStore<StoreApi<object>>>(_store: S) => {
+  const store = _store as WithSelectors<typeof _store>
+  store.use = {} as any
+  for (const k of Object.keys(store.getState())) {
+    ;(store.use as any)[k] = () => store((s) => s[k as keyof typeof s])
+  }
+  return store
+}
+
+// Usage
+const useBearStore = createSelectors(useBearStoreBase)
+const bears = useBearStore.use.bears()         // atomic selector, type-safe
+const increment = useBearStore.use.increment() // stable action ref
+```
+
+Keys are captured when `createSelectors` runs from `Object.keys(getState())`. Keys absent from the initial object (optional fields, symbol keys, keys added later) still get a typed hook that is `undefined` at runtime — initialize optional fields explicitly (`user: undefined`). For a vanilla store, constrain `S extends StoreApi<object>` and build each hook with `useStore(_store, (s) => s[k as keyof typeof s])` instead of calling the store.
+
 ## Scoped Stores via Context
 
 Use the vanilla store + React Context pattern when:
 - Multiple instances of the same store type are needed (e.g., per-form, per-panel).
 - Store needs initialization from props.
 - Test isolation is required without global mocking.
+- The app server-renders (Next.js, Remix) and the store holds per-user data.
 
 ### Store Factory
 
@@ -86,11 +115,13 @@ export const createBearStore = (initialBears = 0) =>
 
 ### Context Provider
 
+Create the store once per provider instance with a lazy `useState` initializer (the pattern used in the upstream docs). A `useRef` with a null check also works.
+
 ```tsx
 // bear-store-provider.tsx
 'use client'
 
-import { createContext, useContext, useRef, type ReactNode } from 'react'
+import { createContext, useContext, useState, type ReactNode } from 'react'
 import { useStore } from 'zustand'
 import { createBearStore, type BearState, type BearStore } from './bear-store'
 
@@ -103,16 +134,8 @@ export const BearStoreProvider = ({
   children: ReactNode
   initialBears?: number
 }) => {
-  const storeRef = useRef<BearStore | null>(null)
-  if (storeRef.current === null) {
-    storeRef.current = createBearStore(initialBears)
-  }
-
-  return (
-    <BearStoreContext.Provider value={storeRef.current}>
-      {children}
-    </BearStoreContext.Provider>
-  )
+  const [store] = useState(() => createBearStore(initialBears))
+  return <BearStoreContext.Provider value={store}>{children}</BearStoreContext.Provider>
 }
 
 export const useBearStore = <T,>(selector: (state: BearState) => T): T => {
@@ -121,6 +144,8 @@ export const useBearStore = <T,>(selector: (state: BearState) => T): T => {
   return useStore(store, selector)
 }
 ```
+
+Props are read only when the store is created. To react to later prop changes, remount the provider with a `key` (simplest), or sync them in an effect that calls `store.setState` inside a block body.
 
 ### Usage in Components
 
@@ -139,7 +164,7 @@ export const useBearStore = <T,>(selector: (state: BearState) => T): T => {
 
 ### Core Constraint
 
-React Server Components cannot use Zustand stores (no hooks, no client-side state). A global module-level store on the server would **leak state across user requests**.
+React Server Components cannot use Zustand stores (no hooks, no client-side state). A global module-level store that is written during a server render would **leak state across user requests**.
 
 ### Required Architecture
 
@@ -168,104 +193,124 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
 ```
 
 **Rules:**
-- Never define stores as global module-level variables in the App Router.
-- Use `createStore` (vanilla) + Context instead of `create` (React hook) for server-compatible patterns.
-- RSCs can pass initial data as props to client provider components.
+- Never write to a module-level store during server rendering.
+- Use `createStore` (vanilla) + Context instead of `create` (React hook) for per-request stores.
+- RSCs can pass initial data as props to client provider components; props must be serializable.
 - Nest providers at route level when stores should be route-scoped.
+
+### Module-Level Stores with `unstable_ssrSafe` (Experimental)
+
+For client-only state that never needs server data (UI toggles, carts filled after mount), v5.0.9+ offers `unstable_ssrSafe` from `zustand/middleware`. It makes every `setState` throw during SSR, so a global store cannot leak data between requests. Server renders always show the initial state, and writes must happen after mount. The API is experimental; prefer the Context pattern when server data must seed the store.
 
 ## SSR and Persist Hydration
 
-When using `persist` middleware with SSR (Next.js, Remix), the server has no access to `localStorage`. This causes hydration mismatches: the server renders with default state while the client hydrates with persisted state.
+When using `persist` middleware with SSR (Next.js, Remix), the server has no access to `localStorage`. On the server, persist runs as an in-memory store and does not attach `store.persist` — touch `store.persist` only in client effects. The server renders default state while the client hydrates persisted state, which can cause hydration mismatches.
 
 ### Solution A: `skipHydration` + Manual Rehydrate
 
 ```ts
-const useStore = create(
+const useStore = create<CounterState>()(
   persist(
     (set) => ({ count: 0, inc: () => set((s) => ({ count: s.count + 1 })) }),
     {
       name: 'counter-storage',
       skipHydration: true,
     },
-  )
+  ),
 )
 
 // In a client component:
 useEffect(() => {
-  useStore.persist.rehydrate()
+  void useStore.persist.rehydrate()
 }, [])
 ```
 
-### Solution B: Hydration Gate with Loading State
+### Solution B: Hydration Flag in State
 
-```ts
-const useStore = create(
+```tsx
+const useStore = create<CounterState & HydrationState>()(
   persist(
     (set) => ({
       count: 0,
+      inc: () => set((s) => ({ count: s.count + 1 })),
       _hasHydrated: false,
       setHasHydrated: (val: boolean) => set({ _hasHydrated: val }),
     }),
     {
       name: 'counter-storage',
+      skipHydration: true, // required for SSR — see below
+      partialize: (s) => ({ count: s.count }), // never persist the flag
       onRehydrateStorage: () => (state) => {
         state?.setHasHydrated(true)
       },
     },
-  )
+  ),
 )
 
-// In component:
+// Once, in a client component near the root:
+useEffect(() => {
+  void useStore.persist.rehydrate()
+}, [])
+
+// In components:
 const hasHydrated = useStore((s) => s._hasHydrated)
 if (!hasHydrated) return <Skeleton />
 ```
 
-### Solution C: `persist.hasHydrated()` API
+Keep `skipHydration: true` in SSR apps. Without it, synchronous `localStorage` hydrates during client-side store creation, so `_hasHydrated` is already `true` on the first client render while the server rendered `<Skeleton />` — a hydration mismatch.
+
+### Solution C: `useHydration` Hook (No Extra State)
 
 ```ts
-// Wait for hydration in a hook
 const useHydration = () => {
-  const [hydrated, setHydrated] = useState(useStore.persist.hasHydrated())
+  const [hydrated, setHydrated] = useState(false)
 
   useEffect(() => {
-    const unsub = useStore.persist.onFinishHydration(() => setHydrated(true))
-    return () => unsub()
+    const unsubHydrate = useStore.persist.onHydrate(() => setHydrated(false)) // manual rehydrate
+    const unsubFinish = useStore.persist.onFinishHydration(() => setHydrated(true))
+    setHydrated(useStore.persist.hasHydrated()) // after subscribing, so no event is missed
+    return () => {
+      unsubHydrate()
+      unsubFinish()
+    }
   }, [])
 
   return hydrated
 }
 ```
 
+Starting from `false` keeps the first client render identical to the server render.
+
+Solutions B and C flip only on successful hydration. If `getItem` rejects or `migrate` throws, the inner `onRehydrateStorage` callback receives `(undefined, error)` and `onFinishHydration` never fires, so render an error or fallback state from that callback instead of a skeleton that never resolves.
+
 ## Resetting Store State
 
 ### Using `getInitialState`
 
 ```ts
-const useStore = create<State & Actions>()((set) => ({
+const useStore = create<State & Actions>()((set, get, store) => ({
   count: 0,
   inc: () => set((s) => ({ count: s.count + 1 })),
+  reset: () => set(store.getInitialState()),
 }))
 
-// Reset to initial state (replace=true removes any extra runtime keys)
-const reset = () => useStore.setState(useStore.getInitialState(), true)
+// Reset from outside (replace=true removes any extra runtime keys)
+useStore.setState(useStore.getInitialState(), true)
 ```
 
-### In Tests
+On a persisted store, `getInitialState()` returns the creator's defaults and the reset writes them to storage. To remove the stored item instead, await the reset before clearing — with async storage an unawaited write can land after the removal and recreate the item:
 
 ```ts
-afterEach(() => {
-  useStore.setState(useStore.getInitialState(), true)
-})
+await useStore.setState(useStore.getInitialState(), true)
+useStore.persist.clearStorage() // returns void; call storage.removeItem directly if you must await the removal
 ```
-
-The `true` flag replaces state entirely, ensuring a clean reset including any accumulated derived state.
 
 ## Testing
 
 ### Recommended Stack
 
 - **Test runner:** Vitest or Jest
-- **UI testing:** React Testing Library
+- **UI testing:** React Testing Library (`user-event` calls are already wrapped in `act`)
 - **Network mocking:** Mock Service Worker (MSW)
 
 ### Store Unit Tests
@@ -312,6 +357,8 @@ it('displays count and increments on click', async () => {
 })
 ```
 
+Wrap direct `store.setState` calls made while components are mounted in `act(() => { ... })` (block body — persisted `setState` may return a Promise).
+
 ### Testing Scoped (Context-Based) Stores
 
 Wrap components in the provider with controlled initial state.
@@ -321,37 +368,107 @@ it('renders with initial bears', () => {
   render(
     <BearStoreProvider initialBears={42}>
       <BearCounter />
-    </BearStoreProvider>
+    </BearStoreProvider>,
   )
   expect(screen.getByText('42')).toBeInTheDocument()
 })
 ```
 
-### Mock Pattern for Test Isolation (Alternative)
+### Auto-Reset Mock for Global Stores
 
-For global stores, create a mock module that resets stores automatically. Store all created stores in a `Set`, and in `afterEach`, iterate and reset each to its initial state.
+For many global stores, mock `zustand` so every store created by `create` or `createStore` resets after each test. A manual mock replaces the entire module: keep `export * from 'zustand'` and wrap both `create` and `createStore`, or `useStore`, `createStore`, and everything else become `undefined` in tests. Load the real implementations with `vi.importActual` / `jest.requireActual`.
 
 ```ts
-// __mocks__/zustand.ts (simplified)
-import { create as actualCreate } from 'zustand'
+// __mocks__/zustand.ts — Vitest. Place next to the configured `root`.
+import { afterEach, vi } from 'vitest'
+import { act } from '@testing-library/react'
+import type * as ZustandExportedTypes from 'zustand'
+export * from 'zustand'
 
-const storeResetFns = new Set<() => void>()
+const { create: actualCreate, createStore: actualCreateStore } =
+  await vi.importActual<typeof ZustandExportedTypes>('zustand')
 
-const createUncurried = <T>(stateCreator: any) => {
+// Reset fns return setState's result: a pending write for persisted stores with async storage
+export const storeResetFns = new Set<() => unknown>()
+
+const createUncurried = <T>(stateCreator: ZustandExportedTypes.StateCreator<T>) => {
   const store = actualCreate(stateCreator)
   const initialState = store.getInitialState()
   storeResetFns.add(() => store.setState(initialState, true))
   return store
 }
 
-// Support both curried create<T>()((set) => ...) and uncurried create((set) => ...)
-export const create = (<T>(stateCreator?: any) => {
-  return stateCreator === undefined
-    ? createUncurried  // curried: create<T>() returns initializer
-    : createUncurried(stateCreator) // uncurried: create((set) => ...)
-}) as typeof actualCreate
+// Supports both create<T>()(creator) and create(creator)
+export const create = (<T>(stateCreator: ZustandExportedTypes.StateCreator<T>) =>
+  typeof stateCreator === 'function'
+    ? createUncurried(stateCreator)
+    : createUncurried) as typeof ZustandExportedTypes.create
 
-afterEach(() => {
-  storeResetFns.forEach((fn) => fn())
+const createStoreUncurried = <T>(stateCreator: ZustandExportedTypes.StateCreator<T>) => {
+  const store = actualCreateStore(stateCreator)
+  const initialState = store.getInitialState()
+  storeResetFns.add(() => store.setState(initialState, true))
+  return store
+}
+
+export const createStore = (<T>(stateCreator: ZustandExportedTypes.StateCreator<T>) =>
+  typeof stateCreator === 'function'
+    ? createStoreUncurried(stateCreator)
+    : createStoreUncurried) as typeof ZustandExportedTypes.createStore
+
+afterEach(async () => {
+  await act(async () => {
+    await Promise.all([...storeResetFns].map((resetFn) => resetFn()))
+  })
 })
+```
+
+The mock replaces only the `zustand` specifier. Stores created with `createStore` imported from `zustand/vanilla` (like the store factory above) bypass it and leak between tests. Mock that entry point too. A store may end up registered by both mocks; resetting it twice is harmless.
+
+```ts
+// __mocks__/zustand/vanilla.ts
+import { afterEach, vi } from 'vitest'
+import { act } from '@testing-library/react'
+import type * as ZustandVanillaTypes from 'zustand/vanilla'
+export * from 'zustand/vanilla'
+
+const { createStore: actualCreateStore } =
+  await vi.importActual<typeof ZustandVanillaTypes>('zustand/vanilla')
+
+const storeResetFns = new Set<() => unknown>()
+
+const createStoreUncurried = <T>(stateCreator: ZustandVanillaTypes.StateCreator<T>) => {
+  const store = actualCreateStore(stateCreator)
+  const initialState = store.getInitialState()
+  storeResetFns.add(() => store.setState(initialState, true))
+  return store
+}
+
+export const createStore = (<T>(stateCreator: ZustandVanillaTypes.StateCreator<T>) =>
+  typeof stateCreator === 'function'
+    ? createStoreUncurried(stateCreator)
+    : createStoreUncurried) as typeof ZustandVanillaTypes.createStore
+
+afterEach(async () => {
+  await act(async () => {
+    await Promise.all([...storeResetFns].map((resetFn) => resetFn()))
+  })
+})
+```
+
+Enable both mocks in a file listed in `test.setupFiles`:
+
+```ts
+// vitest.setup.ts
+import { vi } from 'vitest'
+
+vi.mock('zustand')
+vi.mock('zustand/vanilla')
+```
+
+For Jest, put the files in `__mocks__/zustand.ts` and `__mocks__/zustand/vanilla.ts` adjacent to `node_modules` (applied automatically, no `jest.mock` call needed), drop the `vitest` import, and replace each `await vi.importActual<...>(...)` call with `jest.requireActual<...>(...)`:
+
+```ts
+const { create: actualCreate, createStore: actualCreateStore } =
+  jest.requireActual<typeof ZustandExportedTypes>('zustand')
 ```

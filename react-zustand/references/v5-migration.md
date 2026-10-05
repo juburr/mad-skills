@@ -1,14 +1,15 @@
 # Migrating from Zustand v4 to v5
 
-Zustand v5 is a cleanup release — no new features, just removal of deprecated APIs and modernized defaults. Migration from v4 should be smooth. Update to the latest v4 first (v4.5.x) to surface deprecation warnings before upgrading to v5.
+Zustand v5 is a cleanup release — no new features, just removal of deprecated APIs and modernized defaults. Migration from v4 should be smooth. Update to the latest v4 first (v4.5.7) to surface deprecation warnings, then upgrade straight to the latest v5.0.x (v5.0.15 at the time of writing) rather than v5.0.0 — later patch releases fix persist races, devtools typing, and React Native module resolution.
 
 ## Requirements
 
 | Dependency | v4 Minimum | v5 Minimum |
 |---|---|---|
-| React | 16.8 | **18** |
-| TypeScript | 4.0 | **4.5** |
-| `use-sync-external-store` | bundled | **peer dependency** (only if using `zustand/traditional`) |
+| React | 16.8 | **18** (optional peer — not needed for vanilla-only use) |
+| TypeScript | 3.4 (downlevel types) | **4.5** |
+| `use-sync-external-store` | regular dependency | **peer dependency** (only if using `zustand/traditional`) |
+| React Native 0.79+ | 4.5.7 | **5.0.4** (earlier v5 builds hit `import.meta` errors under Hermes) |
 
 Install `use-sync-external-store` as a peer dependency only if you use `createWithEqualityFn` or `useStoreWithEqualityFn` from `zustand/traditional`. If you only use `create` from `zustand`, it is not needed — v5 uses React 18's native `useSyncExternalStore`.
 
@@ -30,7 +31,7 @@ This applies to all entry points. If your codebase used `import create from 'zus
 
 ### 2. Custom Equality Function Removed from `create`
 
-In v4, `create` accepted an optional equality function as a second argument (or via the hook call). In v5, `create` always uses `Object.is` — matching how React's `useState` works. The equality function parameter is gone.
+In v4, the hook returned by `create` accepted an optional equality function as its second argument (`useStore(selector, shallow)`, deprecated since v4.4). In v5, hooks from `create` always compare selector output with `Object.is` — matching how React's `useState` works. The equality function parameter is gone.
 
 **Migration Option A — `createWithEqualityFn` (drop-in replacement):**
 
@@ -81,7 +82,7 @@ const { nuts, honey } = useStore(
 
 ### 3. Unstable Selectors Now Cause Infinite Loops
 
-In v4, a selector returning a new object reference on every call (e.g., `(s) => ({ a: s.a, b: s.b })`) caused unnecessary re-renders but usually worked. In v5, this pattern can trigger "Maximum update depth exceeded" errors due to stricter comparison in `useSyncExternalStore`.
+In v4, a selector returning a new object reference on every call (e.g., `(s) => ({ a: s.a, b: s.b })`) caused unnecessary re-renders but usually worked, because v4 memoized selections through `useSyncExternalStoreWithSelector`. v5 passes `selector(getState())` to React's native `useSyncExternalStore` as the snapshot, so a new reference on every call looks like a constantly changing store and can trigger "Maximum update depth exceeded".
 
 Fix by applying `useShallow` or selecting atomic values:
 
@@ -98,6 +99,20 @@ const a = useStore((s) => s.a)
 const b = useStore((s) => s.b)
 ```
 
+Inline fallbacks create new references too:
+
+```ts
+// Breaks in v5 — new function/array on every call when the value is missing
+const action = useStore((s) => s.action ?? (() => {}))
+const items = useStore((s) => s.items ?? [])
+
+// Fix: hoist fallbacks to module-level constants
+const NOOP = () => {}
+const EMPTY: Item[] = []
+const action = useStore((s) => s.action ?? NOOP)
+const items = useStore((s) => s.items ?? EMPTY)
+```
+
 ### 4. Stricter `setState` with `replace` Flag
 
 When calling `setState` with the replace flag set to `true`, v5 requires a **complete** state object. Passing a partial or empty object is a type error.
@@ -112,13 +127,22 @@ store.setState({ count: 0, name: '' }, true)
 
 If you are not using the `replace` flag (`setState(partial)` or `setState(partial, false)`), no change is needed.
 
+A flag computed at runtime (`boolean`) matches neither overload. Branch rather than cast, so a partial object can never replace the whole state:
+
+```ts
+if (shouldReplace) store.setState({ count: 0, name: '' }, true) // complete state
+else store.setState({ count: 0 })                               // partial merge
+```
+
+A tuple cast (`[next, shouldReplace] as Parameters<typeof store.setState>`) also compiles, but it hides a partial `next` that would wipe the omitted keys when the flag is `true`.
+
 ### 5. `destroy` Method Removed
 
 The `destroy()` method on the store API was deprecated in v4 and is removed in v5. Zustand stores with no active subscriptions are garbage collected automatically.
 
 ```ts
 // v4 (deprecated)
-const unsub = useStore.destroy()
+useStore.destroy()
 
 // v5 — no replacement needed
 // Stores are garbage collected when unreferenced.
@@ -147,9 +171,9 @@ const useStore = create(
 useStore.setState(useStore.getState())
 ```
 
-### 7. `getInitialState` Added to Store API
+### 7. Use `getInitialState` for Resets
 
-v5 adds `getInitialState()` to the store API. This returns the state as it was when the store was first created and never changes. Use it for store resets:
+`getInitialState()` was added in v4.5.0, so it is already available once you are on the latest v4. It returns the state produced by the initializer and never changes (on persisted stores: the defaults, not hydrated values). Prefer it over hand-maintained `initialState` constants for store resets:
 
 ```ts
 const useStore = create<State & Actions>()((set, get, store) => ({
@@ -172,13 +196,14 @@ This is particularly useful for test cleanup — reset all stores to initial sta
 
 ## Import Path Reference
 
-All valid v5 import paths:
+All documented v5 import paths:
 
 ```ts
 // Core
 import { create } from 'zustand'
-import { createStore } from 'zustand/vanilla'
+import { createStore } from 'zustand/vanilla' // 'zustand' re-exports it but imports React; React-free projects must use this path
 import { useStore } from 'zustand'
+import type { StateCreator, StoreApi, UseBoundStore, ExtractState } from 'zustand' // ExtractState: v5.0.3+
 
 // Traditional (equality function support)
 import { createWithEqualityFn } from 'zustand/traditional'
@@ -186,15 +211,19 @@ import { useStoreWithEqualityFn } from 'zustand/traditional'
 
 // Shallow comparison
 import { useShallow } from 'zustand/react/shallow'  // React hook
-import { shallow } from 'zustand/shallow'            // plain comparison function
+import { shallow } from 'zustand/shallow'            // plain comparison function (module also imports React)
+import { shallow } from 'zustand/vanilla/shallow'    // same function, React-free
 
 // Middleware
 import { devtools, persist, subscribeWithSelector, combine, redux } from 'zustand/middleware'
 import { createJSONStorage } from 'zustand/middleware'
+import { unstable_ssrSafe } from 'zustand/middleware' // experimental, v5.0.9+
 import { immer } from 'zustand/middleware/immer'
 ```
 
 `useShallow` is also re-exported from `zustand/shallow` for convenience. Both `zustand/react/shallow` and `zustand/shallow` work.
+
+Paths such as `zustand/middleware/devtools` or `zustand/middleware/persist` ship only `.d.ts` files: they type-check but fail at runtime. Import those middlewares from `zustand/middleware`.
 
 ## Store API Surface (v5)
 
@@ -204,14 +233,14 @@ useStore(selector)              // React hook
 useStore.getState()             // get current state
 useStore.setState(partial)      // shallow merge
 useStore.setState(full, true)   // replace (requires complete state)
-useStore.getInitialState()      // NEW in v5 — returns initial state
+useStore.getInitialState()      // returns initial state (since v4.5.0)
 useStore.subscribe(listener)    // returns unsubscribe function
 // useStore.destroy()           // REMOVED in v5
 
 // Vanilla store (from createStore) — same API without the hook
 store.getState()
 store.setState(partial)
-store.getInitialState()         // NEW in v5
+store.getInitialState()
 store.subscribe(listener)
 ```
 
@@ -232,12 +261,28 @@ The `subscribe` listener signature is unchanged: `(state: T, prevState: T) => vo
    - If you relied on initial state being written to storage, add an explicit `setState` call.
    - Verify `version` + `migrate` are set if your persisted schema has changed.
 9. **Update build config** if you relied on UMD/SystemJS builds or targeted ES5.
-10. **Run `npm install zustand@5`** and verify your test suite passes.
-11. **Replace `getState()` with `getInitialState()`** in store reset logic and test cleanup.
+10. **Run `npm install zustand@^5.0.15`** and verify your test suite passes.
+11. **Replace hand-written initial-state snapshots with `getInitialState()`** in store reset logic and test cleanup.
+12. **Review behavior changes within v5.0.x** (below) if the codebase relies on persist return values, `shallow` with class instances, or DevTools action names.
+
+## Behavior Changes Within v5.0.x
+
+Patch releases after v5.0.0 changed a few observable behaviors. None require code changes for typical apps, but check these during review:
+
+| Since | Change | Check |
+|---|---|---|
+| 5.0.5 | `shallow`/`useShallow` return `false` when prototypes differ | Selectors comparing class instances or `Object.create(...)` objects |
+| 5.0.5 | Unnamed DevTools actions get stack-inferred names instead of `anonymous` | Tooling or tests that match on action names |
+| 5.0.8 | Persisted `set`/`setState` return the storage `setItem` result | Effects written as `useEffect(() => store.setState(x))` |
+| 5.0.8 | `shallow({ a: undefined }, { b: undefined })` is `false` | Selectors relying on the old equality |
+| 5.0.12 | Inner `onRehydrateStorage` callback receives the latest state | Callbacks that assumed the merged snapshot |
+| 5.0.15 | `persist.clearStorage()` cancels an in-flight hydration | UI gated on `hasHydrated()` after clearing |
 
 ## TypeScript Notes
 
 - The double-parentheses pattern `create<T>()(...)` is unchanged in v5.
 - `StoreApi` no longer includes `destroy`. If your code references `StoreApi['destroy']`, remove it.
 - `setState` with `replace: true` now requires the partial type to be the full state type — incomplete objects are flagged at compile time.
-- `StateCreator` generic signature is unchanged. Existing slice typings work without modification.
+- `StateCreator` generic signature is unchanged. Existing slice typings work without modification; immer-typed slices compose without errors from v5.0.11.
+- `ExtractState<typeof store>` is exported from `zustand` since v5.0.3 — delete local copies of that helper.
+- `StateStorage`, `PersistStorage`, and `PersistOptions` gained optional return-type parameters in v5.0.8; existing annotations keep compiling.

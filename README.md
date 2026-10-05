@@ -25,7 +25,7 @@
 | `react-mui` | Guides building React UIs with [Material UI](https://github.com/mui/material-ui) (MUI), covering component APIs, theming, styling, and version migration. |
 | `react-performance` | Guides React performance optimization including re-render prevention, memoization, concurrent features, and high-frequency updates. |
 | `react-storybook` | Guides building and testing React-TypeScript components with [Storybook](https://github.com/storybookjs/storybook), covering CSF3 story format, interaction testing with play functions, accessibility testing, visual regression testing, portable stories, Next.js App Router mocks, MSW network mocking, and CI/CD integration. |
-| `react-zustand` | Guides [Zustand](https://github.com/pmndrs/zustand) state management including store design, selectors, middleware, TypeScript patterns, performance optimization, and high-frequency update handling. |
+| `react-zustand` | Guides [Zustand](https://github.com/pmndrs/zustand) v5 state management including store design, selectors, middleware (persist, devtools, immer), TypeScript patterns, SSR/Next.js, testing, performance optimization, and high-frequency update handling. |
 | `rust-performance` | Guides Rust performance optimization including profiling, build configuration, allocation reduction, data structure selection, hot loop tuning, memory layout, and parallelism. |
 | `rust-security` | Guides secure Rust coding practices and security reviews. |
 | `vllm-deployment` | Guides deploying, configuring, and troubleshooting [vLLM](https://github.com/vllm-project/vllm) OpenAI-compatible servers, including GPU/VRAM sizing, OOM diagnostics, air-gapped deployments, and vLLM-specific API extensions. |

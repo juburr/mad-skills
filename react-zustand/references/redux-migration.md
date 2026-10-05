@@ -15,7 +15,8 @@ Pragmatic, incremental migration path from Redux (or Redux Toolkit) to Zustand. 
 | `createAsyncThunk` | Async function inside store action using `set`/`get` |
 | Redux DevTools | `devtools` middleware + action naming via third `set` arg |
 | RTK Query | Replace with TanStack Query (React Query) alongside Zustand |
-| `reselect` / `createSelector` | Inline selectors + `useShallow` for multi-value picks |
+| `reselect` / `createSelector` | Inline selectors + `useShallow` for multi-value picks; store expensive derived data in state from actions |
+| `redux-persist` (`whitelist`, `migrate`) | `persist` middleware (`partialize`, `version` + `migrate`) |
 
 ## Migration Strategy
 
@@ -240,7 +241,7 @@ export const useTodosStore = create<TodosStore>()((set) => ({
 
 ## Adding DevTools Parity
 
-Redux projects typically rely on Redux DevTools. Restore this capability with the `devtools` middleware and named actions.
+Redux projects typically rely on Redux DevTools. Restore this capability with the `devtools` middleware and named actions. Set `enabled` explicitly — the default only turns devtools off when the bundler defines `import.meta.env.MODE` (ESM build) or `process.env.NODE_ENV` (CJS build) as `'production'`.
 
 ```ts
 import { devtools } from 'zustand/middleware'
@@ -256,9 +257,12 @@ export const useTodosStore = create<TodosStore>()(
           'todos/addTodo',  // action name for DevTools
         ),
     }),
+    { name: 'TodosStore', enabled: process.env.NODE_ENV !== 'production' },
   )
 )
 ```
+
+Unnamed updates are labeled with the calling function's name inferred from the stack trace (v5.0.5+), which disappears in minified builds — name every action you want to trace.
 
 Use a consistent naming convention (e.g., `feature/action`) for traceability.
 
@@ -266,4 +270,5 @@ Use a consistent naming convention (e.g., `feature/action`) for traceability.
 
 - **Object/array selectors need stable outputs.** React-Redux `useSelector` uses strict `===` reference equality by default (unless you pass a custom `equalityFn` like `shallowEqual`). Zustand v5 likewise compares selector outputs by reference (`Object.is`). Multi-value selectors that construct new objects or arrays must be wrapped with `useShallow` (or return a stable reference) to avoid unnecessary re-renders and potential infinite loops.
 - **No `Provider` means no test isolation by default.** Use `setState` / `getInitialState` to reset stores between tests, or use the vanilla store + Context pattern for scoped test instances.
+- **Persisting a store with an actions namespace.** When replacing `redux-persist` and grouping actions under an `actions` key, `partialize` persisted state to data fields — otherwise the serialized `actions: {}` overwrites real actions on rehydration.
 - **RTK Query has no direct Zustand equivalent.** For server state caching, use TanStack Query alongside Zustand (Zustand for client state, TanStack Query for server state).

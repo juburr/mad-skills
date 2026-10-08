@@ -54,9 +54,9 @@ for stream.Next() {
 	case responses.ResponseIncompleteEvent:
 		final = &e.Response // check final.IncompleteDetails.Reason
 	case responses.ResponseFailedEvent:
-		return fmt.Errorf("response failed: %s", e.Response.Error.Message)
+		return fmt.Errorf("response failed: %s", e.Response.Error.Code) // Message may echo request content
 	case responses.ResponseErrorEvent:
-		return fmt.Errorf("stream error %s: %s", e.Code, e.Message)
+		return fmt.Errorf("stream error: %s", e.Code)
 	}
 }
 if err := stream.Err(); err != nil {

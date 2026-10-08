@@ -43,9 +43,8 @@ client = openai.NewClient(
 )
 ```
 
-- `NewClient` also reads `OPENAI_ADMIN_KEY`, `OPENAI_WEBHOOK_SECRET`, and `OPENAI_CUSTOM_HEADERS` (newline-separated `Name: value` lines).
-- Options apply at client level or per request (every method takes `opts ...option.RequestOption`).
-- An ambient `OPENAI_API_KEY` is sent to any base URL you configure. Pass `option.WithAPIKey("")` to send no `Authorization` header to third-party servers.
+- `NewClient` also reads `OPENAI_ADMIN_KEY`, `OPENAI_WEBHOOK_SECRET`, and `OPENAI_CUSTOM_HEADERS` (newline-separated `Name: value` lines). Options apply at client level or per request (every method takes `opts ...option.RequestOption`).
+- Ambient credentials follow any base URL you configure: `OPENAI_API_KEY`, an `Authorization` line in `OPENAI_CUSTOM_HEADERS`, and the org/project headers. For third-party servers pass `option.WithAPIKey("")` **and** `option.WithHeaderDel("Authorization")`; `WithAPIKey("")` alone leaves a custom-header `Authorization` in place.
 - Create one client at startup and reuse it; `NewClient` returns an `openai.Client` value.
 
 ## Choosing an API
@@ -85,8 +84,7 @@ resp, err = client.Responses.New(ctx, responses.ResponseNewParams{
 })
 ```
 
-- `Instructions` is not carried over by `PreviousResponseID`; resend it each turn.
-- Check `resp.Status` (`completed`, `incomplete`, `failed`) and `resp.IncompleteDetails.Reason` before trusting `OutputText()`.
+- `Instructions` is not carried over by `PreviousResponseID`; resend it each turn. Check `resp.Status` (`completed`, `incomplete`, `failed`) and `resp.IncompleteDetails.Reason` before trusting `OutputText()`.
 
 ## Chat Completions API
 
@@ -124,16 +122,20 @@ for stream.Next() {
 		fmt.Print(e.Delta)
 	case responses.ResponseCompletedEvent:
 		fmt.Println("\ntokens:", e.Response.Usage.TotalTokens) // e.Response is the full final response
+	case responses.ResponseIncompleteEvent: // e.g. max_output_tokens; output so far is partial
+		return fmt.Errorf("response incomplete: %s", e.Response.IncompleteDetails.Reason)
 	case responses.ResponseFailedEvent:
-		return fmt.Errorf("response failed: %s", e.Response.Error.Message)
+		return fmt.Errorf("response failed: %s", e.Response.Error.Code)
+	case responses.ResponseErrorEvent:
+		return fmt.Errorf("stream error: %s", e.Code)
 	}
 }
-if err := stream.Err(); err != nil {
+if err := stream.Err(); err != nil { // transport errors only; protocol failures arrive as events
 	return err
 }
 ```
 
-Do not print `event.Delta` for every event: non-text events (such as shell output deltas) carry JSON in `Delta`.
+Handle every terminal event: `stream.Err()` stays nil for incomplete, failed, and error events. Do not print `event.Delta` for every event: non-text events (such as shell output deltas) carry JSON in `Delta`.
 
 ### Chat Completions Streaming with Accumulator
 
@@ -375,16 +377,15 @@ resp, err := client.Responses.New(ctx, params)
 if err != nil {
 	var apierr *openai.Error
 	if errors.As(err, &apierr) {
-		slog.Error("openai api error",
-			"status", apierr.StatusCode, "code", apierr.Code, "type", apierr.Type,
-			"param", apierr.Param, "message", apierr.Message,
-			"request_id", apierr.Response.Header.Get("x-request-id"))
+		slog.Error("openai api error", "status", apierr.StatusCode, "code", apierr.Code,
+			"type", apierr.Type, "param", apierr.Param, "request_id", apierr.Response.Header.Get("x-request-id"))
 	}
 	return err
 }
 ```
 
 - Since v3.71.0, `err.Error()` (and `%v`, slog) prints only `OpenAI API error: 400 Bad Request`. Never parse the error string; read the fields.
+- `apierr.Message` and `RawJSON()` are raw provider diagnostics that can echo request content. Keep them out of routine logs; surface them only in gated debug paths.
 - `apierr.DumpRequest(true)` / `DumpResponse(true)` include the `Authorization` header and bodies verbatim. Use them only in local debugging, never in logs.
 - Non-API failures (network, timeouts) are returned as-is: `*url.Error`, `context.DeadlineExceeded`.
 
@@ -398,7 +399,7 @@ if err != nil {
 // vLLM / Ollama / other OpenAI-compatible servers
 local := openai.NewClient(
 	option.WithBaseURL("http://localhost:8000/v1/"), // Ollama: http://localhost:11434/v1/
-	option.WithAPIKey("not-needed"),                // placeholder; also stops an ambient OPENAI_API_KEY leaking
+	option.WithAPIKey("not-needed"),                // placeholder; replaces any ambient Authorization
 )
 
 // Azure OpenAI v1 API with an API key

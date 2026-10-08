@@ -17,7 +17,8 @@ OpenAI-compatible servers (vLLM, Ollama, OpenRouter), the plain-HTTP credential 
 | `OPENAI_CUSTOM_HEADERS` | `option.WithHeader` per line | Newline-separated `Name: value` lines |
 
 - A set-but-empty variable still counts as set.
-- An ambient `OPENAI_API_KEY` is sent to whatever base URL you configure, including third-party servers. Pass `option.WithAPIKey("")` to send no `Authorization` header at all (v3.24 sent an empty `Bearer `).
+- Ambient credentials are sent to whatever base URL you configure, including third-party servers: `OPENAI_API_KEY`, any `Authorization` line in `OPENAI_CUSTOM_HEADERS`, and the `OpenAI-Organization` / `OpenAI-Project` headers.
+- A non-empty `option.WithAPIKey(key)` replaces an inherited `Authorization` header. `option.WithAPIKey("")` sends no key of its own (v3.24 sent an empty `Bearer `) but leaves an `OPENAI_CUSTOM_HEADERS` `Authorization` in place; add `option.WithHeaderDel("Authorization")` to remove it. Delete `OpenAI-Organization` and `OpenAI-Project` the same way when they must not reach the server.
 - Admin endpoints ignore `WithAPIKey`; they need the admin key. Regular endpoints ignore the admin key.
 - There is no API-key provider or callback option. For rotating credentials use workload identity, or a middleware that sets `Authorization`.
 
@@ -27,13 +28,14 @@ OpenAI-compatible servers (vLLM, Ollama, OpenRouter), the plain-HTTP credential 
 // Local vLLM or Ollama
 client := openai.NewClient(
 	option.WithBaseURL("http://localhost:8000/v1/"), // Ollama: http://localhost:11434/v1/
-	option.WithAPIKey("not-needed"),                // placeholder; also overrides an ambient OPENAI_API_KEY
+	option.WithAPIKey("not-needed"),                // placeholder; replaces any ambient Authorization
 )
 
 // Remote server without auth: send no Authorization header at all
 remote := openai.NewClient(
 	option.WithBaseURL("http://inference.internal:8000/v1/"),
 	option.WithAPIKey(""),
+	option.WithHeaderDel("Authorization"), // also drops an OPENAI_CUSTOM_HEADERS Authorization
 )
 ```
 
@@ -97,7 +99,7 @@ The release notes say the restriction returns in the next major version. To stay
 1. Do not pin v3.69.0, v3.70.0, or v3.71.0 when any keyed endpoint uses `http://`.
 2. For local development servers, adding `option.WithUnsafeAllowHTTP()` documents intent and is harmless on v3.69.0+ (it does not compile on older versions).
 3. For a remote server that requires a key, terminate TLS in front of it (Caddy, nginx, an ingress) and use `https://`.
-4. For a remote server without auth, use `option.WithAPIKey("")`; requests without credentials were never restricted.
+4. For a remote server without auth, use `option.WithAPIKey("")` plus `option.WithHeaderDel("Authorization")`; requests without credentials were never restricted.
 
 `azure.WithUnsafeAllowHTTP()` is separate and enforced: Azure clients require HTTPS except for loopback with that option.
 

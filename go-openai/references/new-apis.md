@@ -93,8 +93,9 @@ func runWeatherTurn(ctx context.Context, client openai.Client, lookup func(conte
 			},
 		},
 		OnToolError: func(_ context.Context, f openai.BetaAgentToolError) {
-			// The API only receives "Tool handler failed."; f.Err stays local and may be sensitive.
-			log.Printf("tool %s failed at %s stage: %v", f.ToolName, f.Stage, f.Err)
+			// The API only receives "Tool handler failed.". f.Err stays local but can carry
+			// secrets, payloads, or paths, so log a classification, not the raw error.
+			log.Printf("tool %s failed at %s stage (call %s, %T)", f.ToolName, f.Stage, f.CallID, f.Err)
 		},
 	}).WithResultCollection() // required when reading events before FinalResult
 	defer func() { _ = stream.Close() }()
@@ -131,8 +132,8 @@ func runWeatherTurn(ctx context.Context, client openai.Client, lookup func(conte
 |---|---|
 | `Sessions.Stream(ctx, sessionID, AgentSessionStreamParams)` | Fails fast unless the session is `idle`. Must be the session's only input writer |
 | `AgentToolHandler` | `func(ctx, map[string]any) (any, error)`. A `map` result is sent JSON-encoded as a string. Unregistered tools are left for manual `Events.New` |
-| `OnToolError` | Called synchronously with `BetaAgentToolError{Err, ToolName, SessionID, TurnID, CallID, Stage}`; stage is `arguments`, `execution`, or `output` |
-| `stream.Close()` | Releases local resources only. It does not cancel the backend turn |
+| `OnToolError` | Called synchronously with `BetaAgentToolError{Err, ToolName, SessionID, TurnID, CallID, Stage}`; stage is `arguments`, `execution`, or `output`. Treat `Err` as sensitive; inspect it only behind a gated debug path |
+| `stream.Close()` | Releases local resources only. It does not cancel the backend turn; send a cancel event (see Manual Event Handling) when the caller abandons a turn |
 | `stream.FinalResult()` | Untyped `*BetaAgentTurnResult{Turn, Messages}`; also drives tool handlers. Returns `requires_action` if an action has no handler |
 | `NewBetaAgentOutput[T](schema, parse)` | Closes every object and marks all properties required. Rejects `oneOf`, `allOf`, `not`, root `anyOf`/`$ref`, `additionalProperties: true` |
 | `out.Format()` | Value for `AgentTextParam.Format` on the agent or session; use the same schema in both places |
@@ -147,7 +148,7 @@ func runWeatherTurn(ctx context.Context, client openai.Client, lookup func(conte
 
 ### Manual Event Handling
 
-Use `Events.StreamStreaming` plus `Events.New` to follow an active session or answer required actions yourself:
+Use `Events.StreamStreaming` plus `Events.New` to follow an active session, answer required actions yourself, and cancel a turn the caller abandons:
 
 ```go
 stream := client.Beta.Agents.Sessions.Events.StreamStreaming(ctx, sessionID)
@@ -183,14 +184,26 @@ for stream.Next() {
 	}
 }
 if err := stream.Err(); err != nil {
+	if ctx.Err() != nil {
+		// The caller gave up while the turn was still running. Closing the stream does not
+		// stop the backend, and ctx is already canceled, so cancel with a fresh bounded context.
+		cancelCtx, done := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+		defer done()
+		if cerr := cancelTurn(cancelCtx, client, sessionID); cerr != nil {
+			return errors.Join(err, cerr)
+		}
+	}
 	return err
 }
 
-// Cancel the backend turn (closing a stream never does this).
-cancel := openai.NewAgentSessionInputParamAgentSessionInputCancel()
-err = client.Beta.Agents.Sessions.Events.New(ctx, sessionID, openai.BetaAgentSessionEventNewParams{
-	Events: []openai.AgentSessionInputParamUnion{{OfParamAgentSessionInputCancel: &cancel}},
-})
+// cancelTurn stops the session's active turn. Call it from the interruption path,
+// while the turn is still running.
+func cancelTurn(ctx context.Context, client openai.Client, sessionID string) error {
+	ev := openai.NewAgentSessionInputParamAgentSessionInputCancel()
+	return client.Beta.Agents.Sessions.Events.New(ctx, sessionID, openai.BetaAgentSessionEventNewParams{
+		Events: []openai.AgentSessionInputParamUnion{{OfParamAgentSessionInputCancel: &ev}},
+	})
+}
 ```
 
 ### Agents Caveats

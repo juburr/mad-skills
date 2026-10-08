@@ -56,7 +56,7 @@ Every option works at client level (`openai.NewClient(opts...)`) or per request 
 
 | Function | Purpose |
 |---|---|
-| `WithAPIKey(key)` | Bearer key. `WithAPIKey("")` sends no `Authorization` header |
+| `WithAPIKey(key)` | Bearer key; replaces an inherited `Authorization` header. `WithAPIKey("")` sends none of its own but leaves an `OPENAI_CUSTOM_HEADERS` `Authorization` in place (add `WithHeaderDel("Authorization")`) |
 | `WithAdminAPIKey(key)` | Admin key, used only by `client.Admin.Organization.*` |
 | `WithBaseURL(url)` | Endpoint override (vLLM, Ollama, Azure v1, proxies) |
 | `WithDataResidency(option.DataResidencyEU)` | Regional endpoint: `Global`, `US`, `EU`, `AE`. Exclusive with `WithBaseURL` in the same call |
@@ -349,7 +349,7 @@ if f, ok := completion.Usage.JSON.ExtraFields["compute_units"]; ok {
 | Member | Content |
 |---|---|
 | `StatusCode` | HTTP status |
-| `Code`, `Type`, `Param`, `Message` | API error body fields |
+| `Code`, `Type`, `Param`, `Message` | API error body fields; `Message` is free text that can echo request content |
 | `Request`, `Response` | Raw `*http.Request` / `*http.Response` |
 | `RawJSON()` | Raw error JSON |
 | `DumpRequest(body)` / `DumpResponse(body)` | `httputil` dumps; **include `Authorization` headers verbatim** |
@@ -359,10 +359,11 @@ if f, ok := completion.Usage.JSON.ExtraFields["compute_units"]; ok {
 var apierr *openai.Error
 switch {
 case errors.As(err, &apierr):
+	// Message and RawJSON() are raw provider diagnostics that can echo request
+	// content; keep them out of routine logs.
 	slog.Error("openai api error",
 		"status", apierr.StatusCode, "type", apierr.Type, "code", apierr.Code,
-		"param", apierr.Param, "message", apierr.Message,
-		"request_id", apierr.Response.Header.Get("x-request-id"))
+		"param", apierr.Param, "request_id", apierr.Response.Header.Get("x-request-id"))
 case errors.Is(err, context.DeadlineExceeded):
 	slog.Error("openai request timed out") // not retried
 default:

@@ -210,7 +210,7 @@ resp, err := client.Responses.New(ctx, responses.ResponseNewParams{
 })
 ```
 
-Continue normally with `PreviousResponseID: openai.String(resp.ID)` and only new input. Streams emit `responses.ResponseCompactionCompactingEvent` while compacting.
+`ContextManagement` applies to the request that carries it. Resend it on every call in the loop (alongside `PreviousResponseID: openai.String(resp.ID)` and only the new input); otherwise later turns grow past the threshold without compacting. Keeping it in a params value that you reuse across turns does this automatically. Streams emit `responses.ResponseCompactionCompactingEvent` while compacting.
 
 Standalone compaction returns a compacted input window. Preserve every output item verbatim (they include encrypted items and fields the SDK may not model) and start a new chain:
 
@@ -237,6 +237,8 @@ resp, err := client.Responses.New(ctx, responses.ResponseNewParams{
 
 ## Prompt Caching
 
+`PromptCacheOptions` (explicit breakpoints, TTL, prewarming, diagnostics) is supported only on `gpt-5.6` and later. For older models such as `gpt-5.5`, send only `PromptCacheKey`.
+
 | Field | Purpose |
 |---|---|
 | `PromptCacheKey` | Routes requests that share a prefix to the same cache |
@@ -244,11 +246,11 @@ resp, err := client.Responses.New(ctx, responses.ResponseNewParams{
 | `PromptCacheOptions.Ttl` | `"30m"` |
 | `PromptCacheOptions.Prewarm` | `openai.Bool(true)` warms the cache without generating output |
 | `PromptCacheOptions.ComparisonResponseID` | Explains cache misses relative to an earlier response |
-| `PromptCacheRetention` | Deprecated; use `PromptCacheOptions.Ttl` |
+| `PromptCacheRetention` | Deprecated in favor of `PromptCacheOptions.Ttl` |
 
 ```go
 _, err := client.Responses.New(ctx, responses.ResponseNewParams{
-	Model:              openai.ChatModelGPT5_5,
+	Model:              openai.ChatModelGPT5_6Sol, // PromptCacheOptions requires gpt-5.6 or later
 	Instructions:       openai.String(longSystemPrompt),
 	Input:              responses.ResponseNewParamsInputUnion{OfString: openai.String("warmup")},
 	PromptCacheKey:     openai.String("tenant-42"),

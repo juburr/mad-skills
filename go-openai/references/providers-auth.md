@@ -187,7 +187,8 @@ completion, err := client.Chat.Completions.New(ctx, openai.ChatCompletionNewPara
 | `bedrock.EndpointMantle` | `https://bedrock-mantle.{region}.api.aws/openai/v1` | `bedrock-mantle` |
 | `bedrock.EndpointRuntime` | `https://bedrock-runtime.{region}.amazonaws.com/openai/v1` | `bedrock` |
 
-- Credential precedence: `APIKey` or `BedrockTokenProvider` (bearer), then static keys / `AWSProfile` / `AWSCredentialsProvider` (SigV4), then `AWS_BEARER_TOKEN_BEDROCK`, then the default AWS chain. An expired `AWS_BEARER_TOKEN_BEDROCK` shadows the default chain.
+- Configure at most one explicit authentication mode: bearer (`APIKey` or `BedrockTokenProvider`, not both), static keys (`AWSAccessKeyID` + `AWSSecretAccessKey`), `AWSProfile`, or `AWSCredentialsProvider`. Any combination fails at `NewClient` as ambiguous; `SkipAuth` cannot be combined with them either.
+- With no explicit mode, the client falls back to `AWS_BEARER_TOKEN_BEDROCK` (bearer), then the default AWS chain (SigV4). An expired `AWS_BEARER_TOKEN_BEDROCK` shadows the default chain; unset it or configure an explicit mode when SigV4 is required.
 - Region: `AWSRegion`, `AWS_REGION`, `AWS_DEFAULT_REGION`, then AWS config. Base URL: `BaseURL`, `AWS_BEDROCK_BASE_URL`, then the default.
 - Never pass `option.WithBaseURL`, `option.WithAPIKey`, or `option.WithDataResidency` to a Bedrock client; set `bedrock.Config` fields instead.
 - Ambient `OPENAI_*` variables are not inherited.

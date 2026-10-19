@@ -163,7 +163,7 @@ Pin dated snapshots (for example `ChatModelGPT5_5_2026_04_23`) for reproducible 
 | `Stop` | `ChatCompletionNewParamsStopUnion{OfString: ...}` or `{OfStringArray: []string{...}}` |
 | `StreamOptions` | `ChatCompletionStreamOptionsParam{IncludeUsage, IncludeObfuscation}` |
 | `ServiceTier` | `ChatCompletionNewParamsServiceTierAuto`, `Default`, `Flex`, `Scale`, `Priority`, `Fast` (no ultrafast) |
-| `PromptCacheKey`, `PromptCacheOptions` | Cache routing and explicit caching (`Mode`, `Ttl`) |
+| `PromptCacheKey`, `PromptCacheOptions` | Cache routing and explicit caching (`Mode`, `Ttl`); `PromptCacheOptions` requires gpt-5.6 or later |
 | `SafetyIdentifier` | Stable hashed end-user ID |
 | `Moderation` | `ChatCompletionNewParamsModeration{Model, Policy{Input{Mode}, Output{Mode}}}` |
 | `Verbosity` | `ChatCompletionNewParamsVerbosityLow`, `Medium`, `High` |
@@ -271,7 +271,7 @@ if msg := structured.Choices[0].Message; msg.Refusal == "" {
 | `MaxOutputTokens`, `Temperature`, `TopP`, `TopLogprobs` | Sampling |
 | `Store`, `Background`, `Include`, `Metadata`, `Truncation` | Storage, background mode, extra output, truncation strategy |
 | `ContextManagement` | Server-side compaction |
-| `PromptCacheKey`, `PromptCacheOptions` | Prompt caching (`PromptCacheRetention` is deprecated) |
+| `PromptCacheKey`, `PromptCacheOptions` | Prompt caching; `PromptCacheOptions` requires gpt-5.6 or later (`PromptCacheRetention` is deprecated) |
 | `SafetyIdentifier`, `Moderation`, `ServiceTier`, `AccessPrograms` | Safety, moderation, latency tier, cyber programs |
 
 ### Input Item Helpers

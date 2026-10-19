@@ -76,9 +76,10 @@ if err != nil {
 }
 fmt.Println(resp.OutputText())
 
-// Continue the conversation: send only the new input.
+// Continue the conversation: send only the new input, and resend Instructions.
 resp, err = client.Responses.New(ctx, responses.ResponseNewParams{
 	Model:              openai.ChatModelGPT5_5,
+	Instructions:       openai.String("You are a Go expert."),
 	PreviousResponseID: openai.String(resp.ID),
 	Input:              responses.ResponseNewParamsInputUnion{OfString: openai.String("Show an example.")},
 })
@@ -172,8 +173,7 @@ if err := stream.Err(); err != nil {
 fmt.Println("total tokens:", acc.Usage.TotalTokens) // acc embeds the assembled ChatCompletion
 ```
 
-- `AddChunk` returns `bool`, not `error`. Ignoring `false` silently drops chunks.
-- Check `JustFinished*` before printing the chunk's delta. Use the `...ForChoice(i)` variants when `N > 1`.
+- `AddChunk` returns `bool`, not `error`; ignoring `false` silently drops chunks. Check `JustFinished*` before printing the chunk's delta, and use the `...ForChoice(i)` variants when `N > 1`.
 - With `IncludeUsage`, the final chunk has usage and an empty `Choices` slice (hence the length check).
 
 ## Tool Calling
@@ -194,32 +194,32 @@ tools := []responses.ToolUnionParam{{
 		},
 	},
 }}
-resp, err := client.Responses.New(ctx, responses.ResponseNewParams{
+params := responses.ResponseNewParams{
 	Model: openai.ChatModelGPT5_5,
 	Input: responses.ResponseNewParamsInputUnion{OfString: openai.String("Weather in Paris?")},
-	Tools: tools,
-})
-if err != nil {
-	return err
+	Tools: tools, // stays in params, so every turn resends it
 }
-
-var outputs []responses.ResponseInputItemUnionParam
-for _, item := range resp.Output {
-	if item.Type != "function_call" {
-		continue
+for range 8 { // bound the round-trips: the model may call tools again after seeing results
+	resp, err := client.Responses.New(ctx, params)
+	if err != nil {
+		return err
 	}
-	call := item.AsFunctionCall()
-	out := responses.ResponseInputItemParamOfFunctionCallOutput(getWeather(call.Arguments))
-	out.OfFunctionCallOutput.CallID = openai.String(call.CallID) // CallID is param.Opt[string]
-	outputs = append(outputs, out)
-}
-if len(outputs) > 0 {
-	resp, err = client.Responses.New(ctx, responses.ResponseNewParams{
-		Model:              openai.ChatModelGPT5_5,
-		PreviousResponseID: openai.String(resp.ID),
-		Input:              responses.ResponseNewParamsInputUnion{OfInputItemList: outputs},
-		Tools:              tools,
-	})
+	var outputs []responses.ResponseInputItemUnionParam
+	for _, item := range resp.Output {
+		if item.Type != "function_call" {
+			continue
+		}
+		call := item.AsFunctionCall()
+		out := responses.ResponseInputItemParamOfFunctionCallOutput(getWeather(call.Arguments))
+		out.OfFunctionCallOutput.CallID = openai.String(call.CallID) // CallID is param.Opt[string]
+		outputs = append(outputs, out)
+	}
+	if len(outputs) == 0 {
+		fmt.Println(resp.OutputText()) // final answer
+		break
+	}
+	params.PreviousResponseID = openai.String(resp.ID)
+	params.Input = responses.ResponseNewParamsInputUnion{OfInputItemList: outputs}
 }
 ```
 
@@ -245,7 +245,7 @@ params := openai.ChatCompletionNewParams{
 		}),
 	},
 }
-for {
+for range 8 { // bound the round-trips
 	completion, err := client.Chat.Completions.New(ctx, params)
 	if err != nil {
 		return err
@@ -262,7 +262,7 @@ for {
 }
 ```
 
-Bound the loop in production (maximum iterations) and validate tool arguments before executing anything; the SDK never runs tools for you.
+Treat reaching the iteration bound without a final answer as an error, and validate tool arguments before executing anything; the SDK never runs tools for you.
 
 ## Structured Outputs
 
